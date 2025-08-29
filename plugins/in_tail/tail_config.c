@@ -483,13 +483,13 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                                                "fluentbit", "input",
                                                "files_abandoned_total",
                                                "Total number of abandoned files",
-                                               1, (char *[]) {"name"});
+                                               3, (char *[]) {"name", "kube_namespace", "kube_container"});
 
     ctx->cmt_bytes_abandoned = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
                                                "bytes_abandoned_total",
                                                "Total number of pending bytes in abandoned files",
-                                               1, (char *[]) {"name"});
+                                               3, (char *[]) {"name", "kube_namespace", "kube_container"});
 
     /* OLD metrics */
     flb_metrics_add(FLB_TAIL_METRIC_F_OPENED,
