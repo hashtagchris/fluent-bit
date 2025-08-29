@@ -1370,25 +1370,62 @@ void flb_tail_file_remove(struct flb_tail_file *file)
     flb_hash_table_del(ctx->static_hash, file->hash_key);
     flb_hash_table_del(ctx->event_hash, file->hash_key);
 
-    flb_free(file->buf_data);
-    flb_free(file->name);
-    flb_free(file->orig_name);
-    flb_free(file->real_name);
-    flb_sds_destroy(file->hash_key);
-
 #ifdef FLB_HAVE_METRICS
     name = (char *) flb_input_name(ctx->ins);
     ts = cfl_time_now();
     cmt_counter_inc(ctx->cmt_files_closed, ts, 1, (char *[]) {name});
 
     if (file->pending_bytes > 0) {
-        cmt_counter_inc(ctx->cmt_files_abandoned, ts, 1, (char *[]) {name});
-        cmt_counter_add(ctx->cmt_bytes_abandoned, ts, file->pending_bytes, 1, (char *[]) {name});
+        /* Extract kube_namespace and kube_container from filename if possible */
+        /* Potential improvement: Generalize this logic by adding a labels_regex config setting, similar to tag_regex */
+        const char *namespace = "none";
+        const char *container = "none";
+        char ns_buf[128];
+        char cont_buf[128];
+        if (file->orig_name && strncmp(file->orig_name, "/var/log/containers/", 20) == 0) {
+            /* Example: /var/log/containers/nginx-7c77b568c8-5xj2k_default_nginx-logger-576accb1c93d1eee32bb4a17f876be4f79927f7594f44a38bc55c376e3add7da.log */
+            const char *fname = file->orig_name + 20;
+
+            /* Find first '_' (end of pod name) */
+            const char *first_ = strchr(fname, '_');
+            if (first_) {
+                /* Find second '_' (end of namespace name) */
+                const char *second_ = strchr(first_ + 1, '_');
+                if (second_) {
+                    size_t ns_len = second_ - (first_ + 1);
+                    if (ns_len > 0 && ns_len < 128) {
+                        strncpy(ns_buf, first_ + 1, ns_len);
+                        ns_buf[ns_len] = '\0';
+                        namespace = ns_buf;
+                    }
+
+                    /* Find the last '-' (beginning of the hex container id) */
+                    const char *last_dash = strrchr(second_, '-');
+                    if (last_dash) {
+                        size_t cont_len = last_dash - (second_ + 1);
+                        if (cont_len > 0 && cont_len < 128) {
+                            strncpy(cont_buf, second_ + 1, cont_len);
+                            cont_buf[cont_len] = '\0';
+                            container = cont_buf;
+                        }
+                    }
+                }
+            }
+        }
+
+        cmt_counter_inc(ctx->cmt_files_abandoned, ts, 3, (char *[]) {name, namespace, container});
+        cmt_counter_add(ctx->cmt_bytes_abandoned, ts, file->pending_bytes, 3, (char *[]) {name, namespace, container});
     }
 
     /* old api */
     flb_metrics_sum(FLB_TAIL_METRIC_F_CLOSED, 1, ctx->ins->metrics);
 #endif
+
+    flb_free(file->buf_data);
+    flb_free(file->name);
+    flb_free(file->orig_name);
+    flb_free(file->real_name);
+    flb_sds_destroy(file->hash_key);
 
     flb_free(file);
 }
