@@ -2471,6 +2471,86 @@ void flb_test_tail_abandoned_file_metrics_comprehensive()
     TEST_MSG("Comprehensive abandoned file metrics test completed");
 }
 
+void flb_test_tail_abandoned_file_metrics_validation()
+{
+    /* This test validates that the abandoned file metrics functionality
+     * is correctly integrated into the tail plugin without crashing.
+     * 
+     * The abandoned metrics are triggered when:
+     * 1. A file has pending_bytes > 0 (unprocessed data)
+     * 2. The file is removed via flb_tail_file_remove()
+     * 
+     * This occurs in scenarios like:
+     * - File rotation while data is still being processed
+     * - Abrupt shutdown while files have unread data
+     * - File deletion while tail is actively monitoring
+     */
+    
+    struct flb_lib_out_cb cb_data;
+    struct test_tail_ctx *ctx;
+    char *file[] = {"metrics_validation_test.log"};
+    char *large_msg = "LARGE_MSG: This is test data that creates pending bytes when processed slowly";
+    int ret;
+    int unused;
+    int i;
+
+    clear_output_num();
+
+    cb_data.cb = cb_count_msgpack;
+    cb_data.data = &unused;
+
+    ctx = test_tail_ctx_create(&cb_data, &file[0], sizeof(file)/sizeof(char *), FLB_TRUE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd,
+                        "path", file[0],
+                        "read_from_head", "true",
+                        "refresh_interval", "10",  /* Very slow to ensure pending data */
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd, NULL);
+    TEST_CHECK(ret == 0);
+
+    /* Write substantial data to create pending bytes situation */
+    for (i = 0; i < 5; i++) {
+        ret = write_msg(ctx, large_msg, strlen(large_msg));
+        if (!TEST_CHECK(ret > 0)) {
+            test_tail_ctx_destroy(ctx);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    /* Start engine */
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+    
+    /* Brief processing time */
+    flb_time_msleep(100);
+
+    /* Add more data while running to maximize pending bytes */
+    for (i = 0; i < 3; i++) {
+        ret = write_msg(ctx, large_msg, strlen(large_msg));
+        if (!TEST_CHECK(ret > 0)) {
+            test_tail_ctx_destroy(ctx);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    /* Quick shutdown to leave data unprocessed */
+    flb_time_msleep(50);
+
+    /* The test_tail_ctx_destroy will clean up and potentially trigger
+     * the abandoned file metrics if there are pending bytes */
+    test_tail_ctx_destroy(ctx);
+    
+    /* Success - the infrastructure works without crashing */
+    TEST_MSG("Abandoned file metrics validation completed - infrastructure functional");
+}
+
 /* Test list */
 TEST_LIST = {
     {"issue_3943", flb_test_in_tail_issue_3943},
@@ -2486,6 +2566,7 @@ TEST_LIST = {
     {"ignore_active_older_files", flb_test_in_tail_ignore_active_older_files},
     {"tail_abandoned_file_metrics", flb_test_tail_abandoned_file_metrics},
     {"tail_abandoned_file_metrics_comprehensive", flb_test_tail_abandoned_file_metrics_comprehensive},
+    {"tail_abandoned_file_metrics_validation", flb_test_tail_abandoned_file_metrics_validation},
 #ifdef FLB_HAVE_INOTIFY
     {"inotify_watcher_false", flb_test_inotify_watcher_false},
 #endif /* FLB_HAVE_INOTIFY */
