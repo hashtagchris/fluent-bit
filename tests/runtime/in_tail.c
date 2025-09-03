@@ -1877,6 +1877,71 @@ void flb_test_tag_regex()
 
     test_tail_ctx_destroy(ctx);
 }
+
+#ifdef FLB_HAVE_REGEX
+void flb_test_tag_regex_labels()
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_tail_ctx *ctx;
+    char *file[] = {"app1_env2_inst3.log"};
+    char *tag_regex = "(?<app>[a-z0-9]+)_(?<env>[a-z0-9]+)_(?<instance>[a-z0-9]+)\\.log";
+    char *tag = "<app>.<env>.<instance>";
+    char *tag_regex_labels[] = {"app", "env", "instance"};
+    char *msg = "test message for abandoned metrics";
+    int ret;
+    int num;
+
+    char *expected_strs[] = {msg};
+    struct str_list expected = {
+                                .size = sizeof(expected_strs)/sizeof(char*),
+                                .lists = &expected_strs[0],
+    };
+
+    clear_output_num();
+
+    cb_data.cb = cb_check_json_str_list;
+    cb_data.data = &expected;
+
+    ctx = test_tail_ctx_create(&cb_data, &file[0], sizeof(file)/sizeof(char *), FLB_TRUE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->o_ffd,
+                        "path", file[0],
+                        "tag", tag,
+                        "tag_regex", tag_regex,
+                        "tag_regex_labels", "app,env,instance",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "app1.env2.inst3",
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    /* Start the engine */
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    ret = write_msg(ctx, msg, strlen(msg));
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+        exit(EXIT_FAILURE);
+    }
+
+    /* waiting to flush */
+    flb_time_msleep(500);
+
+    num = get_output_num();
+    if (!TEST_CHECK(num > 0))  {
+        TEST_MSG("no outputs");
+    }
+
+    test_tail_ctx_destroy(ctx);
+}
 #endif /* FLB_HAVE_REGEX */
 
 #ifdef FLB_HAVE_SQLDB
@@ -2356,6 +2421,7 @@ TEST_LIST = {
 #ifdef FLB_HAVE_REGEX
     {"parser", flb_test_parser},
     {"tag_regex", flb_test_tag_regex},
+    {"tag_regex_labels", flb_test_tag_regex_labels},
 #endif /* FLB_HAVE_INOTIFY */
 
 #ifdef FLB_HAVE_SQLDB
