@@ -547,17 +547,15 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
      * runtime updates always pass a matching schema. */
     ctx->abandoned_label_count = label_count;
 
+    /* Free the dynamically allocated label_names array (but not the strings) */
+    flb_free(label_names);
+
     /* Ensure counters were created successfully */
     if (!ctx->cmt_files_abandoned || !ctx->cmt_bytes_abandoned || !ctx->cmt_bytes_processed) {
         flb_plg_error(ctx->ins, "could not create tail abandoned file metrics");
-        /* Free the dynamically allocated label_names array (but not the strings) */
-        flb_free(label_names);
         flb_tail_config_destroy(ctx);
         return NULL;
     }
-
-    /* Free the dynamically allocated label_names array (but not the strings) */
-    flb_free(label_names);
 
     /* OLD metrics */
     flb_metrics_add(FLB_TAIL_METRIC_F_OPENED,
