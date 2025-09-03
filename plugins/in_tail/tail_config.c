@@ -480,17 +480,57 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                                                 "Total number of rotated files",
                                                 1, (char *[]) {"name"});
 
+    /* Calculate dynamic label count for abandoned file metrics */
+    int label_count = 1;  /* Always include "name" label */
+    char **label_names = NULL;
+    
+#ifdef FLB_HAVE_REGEX
+    if (ctx->tag_regex_labels && mk_list_size(ctx->tag_regex_labels) > 0) {
+        label_count += mk_list_size(ctx->tag_regex_labels);
+    }
+#endif
+
+    /* Build dynamic label names array */
+    label_names = flb_malloc(label_count * sizeof(char*));
+    if (label_names) {
+        int i = 0;
+        label_names[i++] = "name";  /* First label is always "name" */
+        
+#ifdef FLB_HAVE_REGEX
+        if (ctx->tag_regex_labels && mk_list_size(ctx->tag_regex_labels) > 0) {
+            struct mk_list *head;
+            struct flb_config_map_val *mv;
+            
+            mk_list_foreach(head, ctx->tag_regex_labels) {
+                mv = mk_list_entry(head, struct flb_config_map_val, _head);
+                if (mv->val.str && i < label_count) {
+                    label_names[i++] = mv->val.str;
+                }
+            }
+        }
+#endif
+    } else {
+        /* Fallback to single label if allocation failed */
+        label_count = 1;
+        label_names = (char *[]) {"name"};
+    }
+
     ctx->cmt_files_abandoned = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
                                                "files_abandoned_total",
                                                "Total number of abandoned files",
-                                               1, (char *[]) {"name"});
+                                               label_count, label_names);
 
     ctx->cmt_bytes_abandoned = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
                                                "bytes_abandoned_total",
                                                "Total number of pending bytes in abandoned files",
-                                               1, (char *[]) {"name"});
+                                               label_count, label_names);
+    
+    /* Free the dynamically allocated label_names array (but not the strings) */
+    if (label_names && label_names != (char *[]) {"name"}) {
+        flb_free(label_names);
+    }
 
     /* OLD metrics */
     flb_metrics_add(FLB_TAIL_METRIC_F_OPENED,
