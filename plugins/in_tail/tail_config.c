@@ -521,13 +521,20 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
     ctx->cmt_files_abandoned = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
                                                "files_abandoned_total",
-                                               "Total number of abandoned files",
+                                               "Total number of abandoned log files",
                                                label_count, label_names);
 
     ctx->cmt_bytes_abandoned = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
-                                               "bytes_abandoned_total",
-                                               "Total number of pending bytes in abandoned files",
+                                               "file_bytes_abandoned_total",
+                                               "Total number of pending bytes in abandoned log files",
+                                               label_count, label_names);
+
+    // The stock fluentbit_input_bytes_total metric is based on msgpack bytes
+    ctx->cmt_bytes_processed = cmt_counter_create(ins->cmt,
+                                               "fluentbit", "input",
+                                               "file_bytes_processed_total",
+                                               "Total number of processed bytes in log files. Based on file offsets, not msgpack bytes.",
                                                label_count, label_names);
 
     /* Free the dynamically allocated label_names array (but not the strings) */

@@ -1376,106 +1376,107 @@ void flb_tail_file_remove(struct flb_tail_file *file)
     ts = cfl_time_now();
     cmt_counter_inc(ctx->cmt_files_closed, ts, 1, (char *[]) {name});
 
-    if (file->pending_bytes > 0) {
-        /* Create label values for abandoned file metrics */
-        int label_count = 1;
-        char **label_values = NULL;
+    /* old api */
+    flb_metrics_sum(FLB_TAIL_METRIC_F_CLOSED, 1, ctx->ins->metrics);
 
-        /* Always include instance name as first label value */
-        label_values = flb_malloc(sizeof(char*));
-        if (label_values) {
-            label_values[0] = name;
-        }
+    /* Create label values for abandoned file metrics */
+    int label_count = 1;
+    char **label_values = NULL;
+
+    /* Always include instance name as first label value */
+    label_values = flb_malloc(sizeof(char*));
+    if (label_values) {
+        label_values[0] = name;
+    }
 
 #ifdef FLB_HAVE_REGEX
-        if (ctx->tag_regex && ctx->tag_regex_labels && mk_list_size(ctx->tag_regex_labels) > 0) {
-            ssize_t n;
-            struct flb_regex_search result;
-            struct flb_hash_table *ht;
-            struct mk_list *head;
-            struct flb_slist_entry *mv;
-            char **new_label_values;
-            int ret;
-            const char *tmp;
-            size_t tmp_s;
+    if (ctx->tag_regex && ctx->tag_regex_labels && mk_list_size(ctx->tag_regex_labels) > 0) {
+        ssize_t n;
+        struct flb_regex_search result;
+        struct flb_hash_table *ht;
+        struct mk_list *head;
+        struct flb_slist_entry *mv;
+        char **new_label_values;
+        int ret;
+        const char *tmp;
+        size_t tmp_s;
 
-            /* Count total labels */
-            label_count += mk_list_size(ctx->tag_regex_labels);
+        /* Count total labels */
+        label_count += mk_list_size(ctx->tag_regex_labels);
 
-            /* Parse filename with regex */
-            n = flb_regex_do(ctx->tag_regex, file->orig_name, file->orig_name_len, &result);
-            if (n > 0) {
-                ht = flb_hash_table_create(FLB_HASH_TABLE_EVICT_NONE,
-                                           FLB_HASH_TABLE_SIZE, FLB_HASH_TABLE_SIZE);
-                if (ht) {
-                    flb_regex_parse(ctx->tag_regex, &result, cb_results, ht);
+        /* Parse filename with regex */
+        n = flb_regex_do(ctx->tag_regex, file->orig_name, file->orig_name_len, &result);
+        if (n > 0) {
+            ht = flb_hash_table_create(FLB_HASH_TABLE_EVICT_NONE,
+                                        FLB_HASH_TABLE_SIZE, FLB_HASH_TABLE_SIZE);
+            if (ht) {
+                flb_regex_parse(ctx->tag_regex, &result, cb_results, ht);
 
-                    /* Reallocate label values array */
-                    new_label_values = flb_realloc(label_values, label_count * sizeof(char*));
-                    if (new_label_values) {
-                        label_values = new_label_values;
-
-                        /* Extract label values from regex captures */
-                        int i = 1;
-                        mk_list_foreach(head, ctx->tag_regex_labels) {
-                            mv = mk_list_entry(head, struct flb_slist_entry, _head);
-                            if (mv->str && i < label_count) {
-                                ret = flb_hash_table_get(ht, mv->str, strlen(mv->str),
-                                                       (void *) &tmp, &tmp_s);
-                                if (ret != -1 && tmp) {
-                                    /* Create a null-terminated copy */
-                                    char *value = flb_malloc(tmp_s + 1);
-                                    if (value) {
-                                        memcpy(value, tmp, tmp_s);
-                                        value[tmp_s] = '\0';
-                                        label_values[i] = value;
-                                    } else {
-                                        label_values[i] = "_";
-                                    }
-                                } else {
-                                    label_values[i] = "_";
-                                }
-                                i++;
-                            }
-                        }
-                    }
-
-                    flb_hash_table_destroy(ht);
-                }
-            } else {
-                /* Regex failed, use default values for additional labels */
+                /* Reallocate label values array */
                 new_label_values = flb_realloc(label_values, label_count * sizeof(char*));
                 if (new_label_values) {
                     label_values = new_label_values;
-                    for (int i = 1; i < label_count; i++) {
-                        label_values[i] = "_";
+
+                    /* Extract label values from regex captures */
+                    int i = 1;
+                    mk_list_foreach(head, ctx->tag_regex_labels) {
+                        mv = mk_list_entry(head, struct flb_slist_entry, _head);
+                        if (mv->str && i < label_count) {
+                            ret = flb_hash_table_get(ht, mv->str, strlen(mv->str),
+                                                    (void *) &tmp, &tmp_s);
+                            if (ret != -1 && tmp) {
+                                /* Create a null-terminated copy */
+                                char *value = flb_malloc(tmp_s + 1);
+                                if (value) {
+                                    memcpy(value, tmp, tmp_s);
+                                    value[tmp_s] = '\0';
+                                    label_values[i] = value;
+                                } else {
+                                    label_values[i] = "_";
+                                }
+                            } else {
+                                label_values[i] = "_";
+                            }
+                            i++;
+                        }
                     }
                 }
+
+                flb_hash_table_destroy(ht);
             }
-        }
-#endif
-
-        /* Emit abandoned file metrics with labels */
-        cmt_counter_inc(ctx->cmt_files_abandoned, ts, label_count, label_values);
-        cmt_counter_add(ctx->cmt_bytes_abandoned, ts, file->pending_bytes, label_count, label_values);
-
-        /* Free allocated label values (but not the first one which is just a reference) */
-#ifdef FLB_HAVE_REGEX
-        if (label_count > 1) {
-            for (int i = 1; i < label_count; i++) {
-                if (label_values[i] && strcmp(label_values[i], "_") != 0) {
-                    flb_free(label_values[i]);
+        } else {
+            /* Regex failed, use default values for additional labels */
+            new_label_values = flb_realloc(label_values, label_count * sizeof(char*));
+            if (new_label_values) {
+                label_values = new_label_values;
+                for (int i = 1; i < label_count; i++) {
+                    label_values[i] = "_";
                 }
             }
         }
+    }
 #endif
-        if (label_values) {
-            flb_free(label_values);
-        }
+
+    cmt_counter_add(ctx->cmt_bytes_processed, ts, file->offset, label_count, label_values);
+    cmt_counter_add(ctx->cmt_bytes_abandoned, ts, file->pending_bytes, label_count, label_values);
+
+    if (file->pending_bytes > 0) {
+        cmt_counter_inc(ctx->cmt_files_abandoned, ts, label_count, label_values);
     }
 
-    /* old api */
-    flb_metrics_sum(FLB_TAIL_METRIC_F_CLOSED, 1, ctx->ins->metrics);
+    /* Free allocated label values (but not the first one which is just a reference) */
+#ifdef FLB_HAVE_REGEX
+    if (label_count > 1) {
+        for (int i = 1; i < label_count; i++) {
+            if (label_values[i] && strcmp(label_values[i], "_") != 0) {
+                flb_free(label_values[i]);
+            }
+        }
+    }
+#endif
+    if (label_values) {
+        flb_free(label_values);
+    }
 #endif
 
     flb_free(file->buf_data);
