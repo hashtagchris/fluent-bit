@@ -486,7 +486,8 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
     char **label_names = NULL;
 
 #ifdef FLB_HAVE_REGEX
-    if (ctx->tag_regex_labels && mk_list_size(ctx->tag_regex_labels) > 0) {
+    /* Only add dynamic labels when a tag_regex is configured and label names are provided */
+    if (ctx->tag_regex && ctx->tag_regex_labels && mk_list_size(ctx->tag_regex_labels) > 0) {
         label_count += mk_list_size(ctx->tag_regex_labels);
     }
 #endif
@@ -533,6 +534,19 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                                                "file_bytes_processed_total",
                                                "Total number of processed bytes in log files. Based on file offsets, not msgpack bytes.",
                                                label_count, label_names);
+
+    /* Cache the exact label count used at creation time to ensure
+     * runtime updates always pass a matching schema. */
+    ctx->abandoned_label_count = label_count;
+
+    /* Ensure counters were created successfully */
+    if (!ctx->cmt_files_abandoned || !ctx->cmt_bytes_abandoned || !ctx->cmt_bytes_processed) {
+        flb_plg_error(ctx->ins, "could not create tail abandoned file metrics");
+        /* Free the dynamically allocated label_names array (but not the strings) */
+        flb_free(label_names);
+        flb_tail_config_destroy(ctx);
+        return NULL;
+    }
 
     /* Free the dynamically allocated label_names array (but not the strings) */
     flb_free(label_names);

@@ -1878,7 +1878,6 @@ void flb_test_tag_regex()
     test_tail_ctx_destroy(ctx);
 }
 
-#ifdef FLB_HAVE_REGEX
 void flb_test_tag_regex_labels()
 {
     struct flb_lib_out_cb cb_data;
@@ -1886,7 +1885,6 @@ void flb_test_tag_regex_labels()
     char *file[] = {"app1_env2_inst3.log"};
     char *tag_regex = "(?<app>[a-z0-9]+)_(?<env>[a-z0-9]+)_(?<instance>[a-z0-9]+)\\.log";
     char *tag = "<app>.<env>.<instance>";
-    char *tag_regex_labels[] = {"app", "env", "instance"};
     char *msg = "test message for abandoned metrics";
     int ret;
     int num;
