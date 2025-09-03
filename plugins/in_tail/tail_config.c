@@ -38,6 +38,103 @@
 
 #include <fluent-bit/flb_unicode.h>
 
+#ifdef FLB_HAVE_REGEX
+/* Helper function to parse comma-separated tag_regex_labels and count them */
+static int parse_tag_regex_labels(struct flb_tail_config *ctx, char ***labels_out)
+{
+    int count = 0;
+    char *p, *start, *end;
+    char **labels = NULL;
+    char *tmp_str;
+    size_t len;
+
+    if (!ctx->tag_regex_labels || flb_sds_len(ctx->tag_regex_labels) == 0) {
+        *labels_out = NULL;
+        return 0;
+    }
+
+    /* Count comma-separated items */
+    p = ctx->tag_regex_labels;
+    count = 1;
+    while ((p = strchr(p, ',')) != NULL) {
+        count++;
+        p++;
+    }
+
+    /* Allocate array for labels (plus "name") */
+    labels = flb_malloc(sizeof(char*) * (count + 1));
+    if (!labels) {
+        return -1;
+    }
+
+    /* Always include "name" as first label */
+    labels[0] = "name";
+
+    /* Parse labels */
+    p = ctx->tag_regex_labels;
+    for (int i = 1; i <= count; i++) {
+        start = p;
+
+        /* Skip whitespace */
+        while (*start == ' ' || *start == '\t') {
+            start++;
+        }
+
+        /* Find end */
+        end = strchr(start, ',');
+        if (end) {
+            len = end - start;
+            p = end + 1;
+        } else {
+            len = strlen(start);
+        }
+
+        /* Remove trailing whitespace */
+        while (len > 0 && (start[len-1] == ' ' || start[len-1] == '\t')) {
+            len--;
+        }
+
+        if (len == 0) {
+            /* Empty label, skip */
+            count--;
+            i--;
+            continue;
+        }
+
+        /* Allocate and copy label name */
+        tmp_str = flb_malloc(len + 1);
+        if (!tmp_str) {
+            /* Cleanup previously allocated strings */
+            for (int j = 1; j < i; j++) {
+                flb_free((char*)labels[j]);
+            }
+            flb_free(labels);
+            return -1;
+        }
+        memcpy(tmp_str, start, len);
+        tmp_str[len] = '\0';
+        labels[i] = tmp_str;
+    }
+
+    *labels_out = labels;
+    return count + 1; /* +1 for "name" */
+}
+
+/* Helper function to free parsed labels */
+static void free_parsed_labels(char **labels, int count)
+{
+    if (!labels) {
+        return;
+    }
+
+    /* Skip index 0 ("name" - not allocated), free from index 1 */
+    for (int i = 1; i < count; i++) {
+        flb_free((char*)labels[i]);
+    }
+    flb_free(labels);
+}
+#endif
+
 static int multiline_load_parsers(struct flb_tail_config *ctx)
 {
     struct mk_list *head;
@@ -318,6 +415,15 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
     else {
         ctx->tag_regex = NULL;
     }
+
+    /* tag_regex_labels */
+    tmp = flb_input_get_property("tag_regex_labels", ins);
+    if (tmp) {
+        ctx->tag_regex_labels = flb_sds_create(tmp);
+    }
+    else {
+        ctx->tag_regex_labels = NULL;
+    }
 #endif
 
     /* Check if it should use dynamic tags */
@@ -461,35 +567,63 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
 #endif
 
 #ifdef FLB_HAVE_METRICS
+    /* Parse tag_regex_labels for metrics */
+    char **metric_labels = NULL;
+    int metric_label_count = 1; /* default: just "name" */
+
+#ifdef FLB_HAVE_REGEX
+    if (ctx->tag_regex_labels) {
+        metric_label_count = parse_tag_regex_labels(ctx, &metric_labels);
+        if (metric_label_count == -1) {
+            flb_plg_error(ctx->ins, "failed to parse tag_regex_labels");
+            flb_tail_config_destroy(ctx);
+            return NULL;
+        }
+    }
+#endif
+
+    /* Use default labels if no tag_regex_labels configured */
+    if (!metric_labels) {
+        metric_labels = (char *[]) {"name"};
+        metric_label_count = 1;
+    }
+
     ctx->cmt_files_opened = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
                                                "files_opened_total",
                                                "Total number of opened files",
-                                               1, (char *[]) {"name"});
+                                               metric_label_count, metric_labels);
 
     ctx->cmt_files_closed = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
                                                "files_closed_total",
                                                "Total number of closed files",
-                                               1, (char *[]) {"name"});
+                                               metric_label_count, metric_labels);
 
     ctx->cmt_files_rotated = cmt_counter_create(ins->cmt,
                                                 "fluentbit", "input",
                                                 "files_rotated_total",
                                                 "Total number of rotated files",
-                                                1, (char *[]) {"name"});
+                                                metric_label_count, metric_labels);
 
     ctx->cmt_files_abandoned = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
                                                "files_abandoned_total",
                                                "Total number of abandoned files",
-                                               1, (char *[]) {"name"});
+                                               metric_label_count, metric_labels);
 
     ctx->cmt_bytes_abandoned = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
                                                "bytes_abandoned_total",
                                                "Total number of pending bytes in abandoned files",
-                                               1, (char *[]) {"name"});
+                                               metric_label_count, metric_labels);
+
+#ifdef FLB_HAVE_REGEX
+    /* Free the allocated labels if they were parsed */
+    if (ctx->tag_regex_labels && metric_labels) {
+        free_parsed_labels(metric_labels, metric_label_count);
+    }
+#endif
 
     /* OLD metrics */
     flb_metrics_add(FLB_TAIL_METRIC_F_OPENED,
@@ -523,6 +657,10 @@ int flb_tail_config_destroy(struct flb_tail_config *config)
 #ifdef FLB_HAVE_REGEX
     if (config->tag_regex) {
         flb_regex_destroy(config->tag_regex);
+    }
+
+    if (config->tag_regex_labels) {
+        flb_sds_destroy(config->tag_regex_labels);
     }
 #endif
 

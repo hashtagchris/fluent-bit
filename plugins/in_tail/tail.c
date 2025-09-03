@@ -745,6 +745,12 @@ static struct flb_config_map config_map[] = {
      "set a regex to extract fields from the file name and use them later to "
      "compose the Tag."
     },
+    {
+     FLB_CONFIG_MAP_STR, "tag_regex_labels", NULL,
+     0, FLB_FALSE, 0,
+     "set a comma separated list of regex capture group names to use as "
+     "metric labels in addition to 'name'."
+    },
 #endif
 
 #ifdef FLB_HAVE_SQLDB

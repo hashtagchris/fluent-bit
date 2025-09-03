@@ -79,6 +79,7 @@ struct flb_tail_config {
     int dynamic_tag;           /* dynamic tag ? e.g: abc.*     */
 #ifdef FLB_HAVE_REGEX
     struct flb_regex *tag_regex;/* path to tag regex           */
+    flb_sds_t tag_regex_labels; /* comma separated list of regex capture groups for metric labels */
 #endif
     int refresh_interval_sec;  /* seconds to re-scan           */
     long refresh_interval_nsec;/* nanoseconds to re-scan       */
