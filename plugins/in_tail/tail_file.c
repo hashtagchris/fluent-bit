@@ -1379,24 +1379,14 @@ void flb_tail_file_remove(struct flb_tail_file *file)
     /* old api */
     flb_metrics_sum(FLB_TAIL_METRIC_F_CLOSED, 1, ctx->ins->metrics);
 
-    /* Create label values for abandoned file metrics */
-    /* Use the cached label count computed at init time to ensure consistency
-     * with the metric schema used during cmt_counter_create(). */
+    /* Create label values for abandoned file metrics
+     * Use the cached label count computed at init time to ensure consistency
+     * with the metric schema used during cmt_counter_create(). We keep a fixed
+     * stack array sized by the configured maximum number of dynamic labels. */
     int label_count = ctx->abandoned_label_count > 0 ? ctx->abandoned_label_count : 1;
-    char **label_values = NULL;
-    int use_heap_labels = FLB_TRUE;
-    char *labels_stack[1];
+    char *labels_stack[1 + FLB_TAIL_REGEX_LABELS_MAX];
+    char **label_values = labels_stack;
     char *underscore = "_";
-
-    /* Allocate label array and set defaults */
-    label_values = flb_calloc(label_count, sizeof(char *));
-    if (!label_values) {
-        /* Fallback to stack labels with just the instance name */
-        use_heap_labels = FLB_FALSE;
-        labels_stack[0] = name;
-        label_values = labels_stack;
-        label_count = 1;
-    }
 
     /* Always include instance name as first label value */
     label_values[0] = name;
@@ -1469,17 +1459,12 @@ void flb_tail_file_remove(struct flb_tail_file *file)
 
     /* Free allocated label values (but not the first one which is just a reference) */
 #ifdef FLB_HAVE_REGEX
-    if (use_heap_labels && label_count > 1) {
-        for (int i = 1; i < label_count; i++) {
-            if (label_values[i] && label_values[i] != underscore) {
-                flb_free(label_values[i]);
-            }
+    for (int i = 1; i < label_count; i++) {
+        if (label_values[i] && label_values[i] != underscore) {
+            flb_free(label_values[i]);
         }
     }
 #endif
-    if (use_heap_labels && label_values) {
-        flb_free(label_values);
-    }
 #endif
 
     flb_free(file->buf_data);

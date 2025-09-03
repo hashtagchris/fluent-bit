@@ -488,7 +488,15 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
 #ifdef FLB_HAVE_REGEX
     /* Only add dynamic labels when a tag_regex is configured and label names are provided */
     if (ctx->tag_regex && ctx->tag_regex_labels && mk_list_size(ctx->tag_regex_labels) > 0) {
-        label_count += mk_list_size(ctx->tag_regex_labels);
+        int dyn = mk_list_size(ctx->tag_regex_labels);
+        if (dyn > FLB_TAIL_REGEX_LABELS_MAX) {
+            flb_plg_error(ctx->ins,
+                          "tag_regex_labels supports up to %d labels, got %d",
+                          FLB_TAIL_REGEX_LABELS_MAX, dyn);
+            flb_tail_config_destroy(ctx);
+            return NULL;
+        }
+        label_count += dyn;
     }
 #endif
 

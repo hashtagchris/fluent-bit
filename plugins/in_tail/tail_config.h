@@ -29,6 +29,8 @@
 #include <fluent-bit/flb_log_event.h>
 #ifdef FLB_HAVE_REGEX
 #include <fluent-bit/flb_regex.h>
+/* Maximum number of dynamic labels derived from tag_regex_labels */
+#define FLB_TAIL_REGEX_LABELS_MAX 8
 #endif
 #ifdef FLB_HAVE_PARSER
 #include <fluent-bit/multiline/flb_ml.h>
