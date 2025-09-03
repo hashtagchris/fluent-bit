@@ -566,7 +566,7 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                     "files_closed", ctx->ins->metrics);
     flb_metrics_add(FLB_TAIL_METRIC_F_ROTATED,
                     "files_rotated", ctx->ins->metrics);
-#endif
+#endif /* FLB_HAVE_METRICS */
 
     return ctx;
 }

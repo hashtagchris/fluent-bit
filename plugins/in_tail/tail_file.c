@@ -1465,7 +1465,7 @@ void flb_tail_file_remove(struct flb_tail_file *file)
         }
     }
 #endif
-#endif
+#endif /* FLB_HAVE_METRICS */
 
     flb_free(file->buf_data);
     flb_free(file->name);
