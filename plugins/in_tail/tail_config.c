@@ -482,6 +482,7 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
 
     /* Calculate dynamic label count for abandoned file metrics */
     int label_count = 1;  /* Always include "name" label */
+    int label_i = 0;
     char **label_names = NULL;
 
 #ifdef FLB_HAVE_REGEX
@@ -498,8 +499,7 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
         flb_tail_config_destroy(ctx);
         return NULL;
     }
-    i = 0;
-    label_names[i++] = "name";  /* First label is always "name" */
+    label_names[label_i++] = "name";  /* First label is always "name" */
 
 #ifdef FLB_HAVE_REGEX
     if (ctx->tag_regex_labels && mk_list_size(ctx->tag_regex_labels) > 0) {
@@ -508,8 +508,8 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
 
         mk_list_foreach(head, ctx->tag_regex_labels) {
             mv = mk_list_entry(head, struct flb_slist_entry, _head);
-            if (mv->str && i < label_count) {
-                label_names[i++] = mv->str;
+            if (mv->str && label_i < label_count) {
+                label_names[label_i++] = mv->str;
             }
         }
     }
