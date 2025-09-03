@@ -483,6 +483,8 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
     /* Calculate dynamic label count for abandoned file metrics */
     int label_count = 1;  /* Always include "name" label */
     char **label_names = NULL;
+    int allocated_labels = 0;  /* Track if we allocated memory */
+    char *static_name_label = "name";  /* Static fallback */
     
 #ifdef FLB_HAVE_REGEX
     if (ctx->tag_regex_labels && mk_list_size(ctx->tag_regex_labels) > 0) {
@@ -494,6 +496,7 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
     label_names = flb_malloc(label_count * sizeof(char*));
     if (label_names) {
         int i = 0;
+        allocated_labels = 1;
         label_names[i++] = "name";  /* First label is always "name" */
         
 #ifdef FLB_HAVE_REGEX
@@ -512,7 +515,7 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
     } else {
         /* Fallback to single label if allocation failed */
         label_count = 1;
-        label_names = (char *[]) {"name"};
+        label_names = &static_name_label;
     }
 
     ctx->cmt_files_abandoned = cmt_counter_create(ins->cmt,
@@ -528,7 +531,7 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                                                label_count, label_names);
     
     /* Free the dynamically allocated label_names array (but not the strings) */
-    if (label_names && label_names != (char *[]) {"name"}) {
+    if (allocated_labels) {
         flb_free(label_names);
     }
 
