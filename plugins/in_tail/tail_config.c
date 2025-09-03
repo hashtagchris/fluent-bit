@@ -518,24 +518,11 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
         label_names = &static_name_label;
     }
 
-    flb_plg_warn(ctx->ins, "got here 521. label count: %d", label_count);
-    if (label_count > 0) {
-        flb_plg_warn(ctx->ins, "got here 521. label[0]: %s", label_names[0]);
-    }
-    if (label_count > 1) {
-        flb_plg_warn(ctx->ins, "got here 521. label[1]: %s", label_names[1]);
-    }
-    if (label_count > 2) {
-        flb_plg_warn(ctx->ins, "got here 521. label[2]: %s", label_names[2]);
-    }
-
     ctx->cmt_files_abandoned = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
                                                "files_abandoned_total",
                                                "Total number of abandoned files",
                                                label_count, label_names);
-
-    flb_plg_warn(ctx->ins, "got here 529");
 
     ctx->cmt_bytes_abandoned = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
@@ -543,14 +530,9 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                                                "Total number of pending bytes in abandoned files",
                                                label_count, label_names);
 
-    flb_plg_warn(ctx->ins, "got here 537");
-
     /* Free the dynamically allocated label_names array (but not the strings) */
     if (allocated_labels) {
-
         flb_free(label_names);
-
-        flb_plg_warn(ctx->ins, "got here 539.");
     }
 
     /* OLD metrics */
