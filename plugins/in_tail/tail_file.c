@@ -1317,7 +1317,7 @@ void flb_tail_file_remove(struct flb_tail_file *file)
                   file->inode, file->name);
 
     if (file->pending_bytes > 0) {
-        flb_plg_warn(ctx->ins, "inode=%"PRIu64" abandoning file name %s with %d pending bytes",
+        flb_plg_warn(ctx->ins, "inode=%"PRIu64" abandoning file name %s with %"PRId64" pending bytes",
                      file->inode, file->name, file->pending_bytes);
     }
 
