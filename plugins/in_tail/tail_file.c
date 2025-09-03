@@ -1371,12 +1371,6 @@ void flb_tail_file_remove(struct flb_tail_file *file)
     flb_hash_table_del(ctx->static_hash, file->hash_key);
     flb_hash_table_del(ctx->event_hash, file->hash_key);
 
-    flb_free(file->buf_data);
-    flb_free(file->name);
-    flb_free(file->orig_name);
-    flb_free(file->real_name);
-    flb_sds_destroy(file->hash_key);
-
 #ifdef FLB_HAVE_METRICS
     name = (char *) flb_input_name(ctx->ins);
     ts = cfl_time_now();
@@ -1428,7 +1422,7 @@ void flb_tail_file_remove(struct flb_tail_file *file)
                             if (mv->str && i < label_count) {
                                 ret = flb_hash_table_get(ht, mv->str, strlen(mv->str),
                                                        (void *) &tmp, &tmp_s);
-                                if (ret == 0 && tmp) {
+                                if (ret != -1 && tmp) {
                                     /* Create a null-terminated copy */
                                     char *value = flb_malloc(tmp_s + 1);
                                     if (value) {
@@ -1483,6 +1477,12 @@ void flb_tail_file_remove(struct flb_tail_file *file)
     /* old api */
     flb_metrics_sum(FLB_TAIL_METRIC_F_CLOSED, 1, ctx->ins->metrics);
 #endif
+
+    flb_free(file->buf_data);
+    flb_free(file->name);
+    flb_free(file->orig_name);
+    flb_free(file->real_name);
+    flb_sds_destroy(file->hash_key);
 
     flb_free(file);
 }
