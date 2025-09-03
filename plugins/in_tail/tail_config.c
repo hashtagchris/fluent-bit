@@ -527,7 +527,7 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                                                "Total number of pending bytes in abandoned log files",
                                                label_count, label_names);
 
-    // The stock fluentbit_input_bytes_total metric is based on msgpack bytes
+    /* Note: The stock fluentbit_input_bytes_total metric is based on msgpack bytes */
     ctx->cmt_bytes_processed = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
                                                "file_bytes_processed_total",
