@@ -29,6 +29,7 @@
 #include <fluent-bit/flb_compat.h>
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_input_plugin.h>
+#include <fluent-bit/flb_slist.h>
 #include <fluent-bit/flb_parser.h>
 #ifdef FLB_HAVE_REGEX
 #include <fluent-bit/flb_regex.h>
@@ -1370,25 +1371,107 @@ void flb_tail_file_remove(struct flb_tail_file *file)
     flb_hash_table_del(ctx->static_hash, file->hash_key);
     flb_hash_table_del(ctx->event_hash, file->hash_key);
 
-    flb_free(file->buf_data);
-    flb_free(file->name);
-    flb_free(file->orig_name);
-    flb_free(file->real_name);
-    flb_sds_destroy(file->hash_key);
-
 #ifdef FLB_HAVE_METRICS
     name = (char *) flb_input_name(ctx->ins);
     ts = cfl_time_now();
     cmt_counter_inc(ctx->cmt_files_closed, ts, 1, (char *[]) {name});
 
-    if (file->pending_bytes > 0) {
-        cmt_counter_inc(ctx->cmt_files_abandoned, ts, 1, (char *[]) {name});
-        cmt_counter_add(ctx->cmt_bytes_abandoned, ts, file->pending_bytes, 1, (char *[]) {name});
-    }
-
     /* old api */
     flb_metrics_sum(FLB_TAIL_METRIC_F_CLOSED, 1, ctx->ins->metrics);
+
+    /* Create label values for abandoned file metrics
+     * Use the cached label count computed at init time to ensure consistency
+     * with the metric schema used during cmt_counter_create(). We keep a fixed
+     * stack array sized by the configured maximum number of dynamic labels. */
+    int label_count = ctx->abandoned_label_count > 0 ? ctx->abandoned_label_count : 1;
+    char *labels_stack[1 + FLB_TAIL_REGEX_LABELS_MAX];
+    char **label_values = labels_stack;
+    char *underscore = "_";
+
+    /* Always include instance name as first label value */
+    label_values[0] = name;
+
+    /* Initialize extra labels to default "_" */
+    for (int i = 1; i < label_count; i++) {
+        label_values[i] = underscore;
+    }
+
+#ifdef FLB_HAVE_REGEX
+    if (label_count > 1 && ctx->tag_regex && ctx->tag_regex_labels && mk_list_size(ctx->tag_regex_labels) > 0) {
+        ssize_t n;
+        struct flb_regex_search result;
+        struct flb_hash_table *ht;
+        struct mk_list *head;
+        struct flb_slist_entry *mv;
+        int ret;
+        const char *tmp;
+        size_t tmp_s;
+
+        /* Parse filename with regex */
+        n = flb_regex_do(ctx->tag_regex, file->orig_name, file->orig_name_len, &result);
+        if (n > 0) {
+            ht = flb_hash_table_create(FLB_HASH_TABLE_EVICT_NONE,
+                                       FLB_HASH_TABLE_SIZE, FLB_HASH_TABLE_SIZE);
+            if (ht) {
+                flb_regex_parse(ctx->tag_regex, &result, cb_results, ht);
+
+                /* Extract label values from regex captures */
+                int i = 1;
+                mk_list_foreach(head, ctx->tag_regex_labels) {
+                    mv = mk_list_entry(head, struct flb_slist_entry, _head);
+                    if (mv->str && i < label_count) {
+                        ret = flb_hash_table_get(ht, mv->str, strlen(mv->str),
+                                                 (void *) &tmp, &tmp_s);
+                        if (ret != -1 && tmp && tmp_s > 0) {
+                            /* Create a null-terminated copy */
+                            char *value = flb_malloc(tmp_s + 1);
+                            if (value) {
+                                memcpy(value, tmp, tmp_s);
+                                value[tmp_s] = '\0';
+                                label_values[i] = value;
+                            }
+                        }
+                        i++;
+                    }
+                }
+
+                flb_hash_table_destroy(ht);
+            }
+        }
+    }
 #endif
+
+    /*
+     * Record file bytes processed and abandoned using the final file offsets.
+     * Note: processed bytes are accounted once on file removal using the
+     * raw file offset; abandoned bytes may be zero when no pending data.
+     */
+    if (ctx->cmt_bytes_processed) {
+        cmt_counter_add(ctx->cmt_bytes_processed, ts, file->offset, label_count, label_values);
+    }
+    if (ctx->cmt_bytes_abandoned) {
+        cmt_counter_add(ctx->cmt_bytes_abandoned, ts, file->pending_bytes, label_count, label_values);
+    }
+
+    if (file->pending_bytes > 0 && ctx->cmt_files_abandoned) {
+        cmt_counter_inc(ctx->cmt_files_abandoned, ts, label_count, label_values);
+    }
+
+    /* Free allocated label values (but not the first one which is just a reference) */
+#ifdef FLB_HAVE_REGEX
+    for (int i = 1; i < label_count; i++) {
+        if (label_values[i] && label_values[i] != underscore) {
+            flb_free(label_values[i]);
+        }
+    }
+#endif
+#endif /* FLB_HAVE_METRICS */
+
+    flb_free(file->buf_data);
+    flb_free(file->name);
+    flb_free(file->orig_name);
+    flb_free(file->real_name);
+    flb_sds_destroy(file->hash_key);
 
     flb_free(file);
 }

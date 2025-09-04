@@ -19,6 +19,7 @@
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_input_plugin.h>
+#include <fluent-bit/flb_config_map.h>
 #include <fluent-bit/multiline/flb_ml.h>
 #include <fluent-bit/multiline/flb_ml_parser.h>
 
@@ -479,17 +480,82 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                                                 "Total number of rotated files",
                                                 1, (char *[]) {"name"});
 
+    /* Calculate dynamic label count for abandoned file metrics */
+    int label_count = 1;  /* Always include "name" label */
+    int label_i = 0;
+    char **label_names = NULL;
+
+#ifdef FLB_HAVE_REGEX
+    /* Only add dynamic labels when a tag_regex is configured and label names are provided */
+    if (ctx->tag_regex && ctx->tag_regex_labels && mk_list_size(ctx->tag_regex_labels) > 0) {
+        int dyn = mk_list_size(ctx->tag_regex_labels);
+        if (dyn > FLB_TAIL_REGEX_LABELS_MAX) {
+            flb_plg_error(ctx->ins,
+                          "tag_regex_labels supports up to %d labels, got %d",
+                          FLB_TAIL_REGEX_LABELS_MAX, dyn);
+            flb_tail_config_destroy(ctx);
+            return NULL;
+        }
+        label_count += dyn;
+    }
+#endif
+
+    /* Build dynamic label names array */
+    label_names = flb_malloc(label_count * sizeof(char*));
+    if (!label_names) {
+        flb_errno();
+        flb_plg_error(ctx->ins, "could not allocate label names");
+        flb_tail_config_destroy(ctx);
+        return NULL;
+    }
+    label_names[label_i++] = "name";  /* First label is always "name" */
+
+#ifdef FLB_HAVE_REGEX
+    if (ctx->tag_regex_labels && mk_list_size(ctx->tag_regex_labels) > 0) {
+        struct mk_list *head;
+        struct flb_slist_entry *mv;
+
+        mk_list_foreach(head, ctx->tag_regex_labels) {
+            mv = mk_list_entry(head, struct flb_slist_entry, _head);
+            if (mv->str && label_i < label_count) {
+                label_names[label_i++] = mv->str;
+            }
+        }
+    }
+#endif
+
     ctx->cmt_files_abandoned = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
                                                "files_abandoned_total",
-                                               "Total number of abandoned files",
-                                               1, (char *[]) {"name"});
+                                               "Total number of abandoned log files",
+                                               label_count, label_names);
 
     ctx->cmt_bytes_abandoned = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
-                                               "bytes_abandoned_total",
-                                               "Total number of pending bytes in abandoned files",
-                                               1, (char *[]) {"name"});
+                                               "file_bytes_abandoned_total",
+                                               "Total number of pending bytes in abandoned log files",
+                                               label_count, label_names);
+
+    /* Note: The stock fluentbit_input_bytes_total metric is based on msgpack bytes */
+    ctx->cmt_bytes_processed = cmt_counter_create(ins->cmt,
+                                               "fluentbit", "input",
+                                               "file_bytes_processed_total",
+                                               "Total number of processed bytes in log files. Based on file offsets, not msgpack bytes.",
+                                               label_count, label_names);
+
+    /* Cache the exact label count used at creation time to ensure
+     * runtime updates always pass a matching schema. */
+    ctx->abandoned_label_count = label_count;
+
+    /* Free the dynamically allocated label_names array (but not the strings) */
+    flb_free(label_names);
+
+    /* Ensure counters were created successfully */
+    if (!ctx->cmt_files_abandoned || !ctx->cmt_bytes_abandoned || !ctx->cmt_bytes_processed) {
+        flb_plg_error(ctx->ins, "could not create tail abandoned file metrics");
+        flb_tail_config_destroy(ctx);
+        return NULL;
+    }
 
     /* OLD metrics */
     flb_metrics_add(FLB_TAIL_METRIC_F_OPENED,
@@ -498,7 +564,7 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                     "files_closed", ctx->ins->metrics);
     flb_metrics_add(FLB_TAIL_METRIC_F_ROTATED,
                     "files_rotated", ctx->ins->metrics);
-#endif
+#endif /* FLB_HAVE_METRICS */
 
     return ctx;
 }

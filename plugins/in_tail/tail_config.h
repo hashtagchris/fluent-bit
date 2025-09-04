@@ -29,6 +29,8 @@
 #include <fluent-bit/flb_log_event.h>
 #ifdef FLB_HAVE_REGEX
 #include <fluent-bit/flb_regex.h>
+/* Maximum number of dynamic labels derived from tag_regex_labels */
+#define FLB_TAIL_REGEX_LABELS_MAX 8
 #endif
 #ifdef FLB_HAVE_PARSER
 #include <fluent-bit/multiline/flb_ml.h>
@@ -79,6 +81,7 @@ struct flb_tail_config {
     int dynamic_tag;           /* dynamic tag ? e.g: abc.*     */
 #ifdef FLB_HAVE_REGEX
     struct flb_regex *tag_regex;/* path to tag regex           */
+    struct mk_list *tag_regex_labels; /* list of regex capture group names for metrics labels */
 #endif
     int refresh_interval_sec;  /* seconds to re-scan           */
     long refresh_interval_nsec;/* nanoseconds to re-scan       */
@@ -169,6 +172,10 @@ struct flb_tail_config {
     struct cmt_counter *cmt_files_rotated;
     struct cmt_counter *cmt_files_abandoned;
     struct cmt_counter *cmt_bytes_abandoned;
+    struct cmt_counter *cmt_bytes_processed;
+
+    /* Cached number of labels used for abandoned file metrics */
+    int abandoned_label_count;
 
     /* Hash: hash tables for quick acess to registered files */
     struct flb_hash_table *static_hash;
