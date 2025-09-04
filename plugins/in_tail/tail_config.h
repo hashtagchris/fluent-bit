@@ -171,8 +171,7 @@ struct flb_tail_config {
     struct cmt_counter *cmt_files_closed;
     struct cmt_counter *cmt_files_rotated;
     struct cmt_counter *cmt_files_abandoned;
-    struct cmt_counter *cmt_bytes_abandoned;
-    struct cmt_counter *cmt_bytes_processed;
+    struct cmt_counter *cmt_file_bytes_total;
 
     /* Cached number of labels used for abandoned file metrics */
     int abandoned_label_count;

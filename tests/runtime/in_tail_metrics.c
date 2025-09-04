@@ -251,7 +251,7 @@ static void test_tail_metrics_labels()
 
         /* processed bytes metric with labels present */
         re_processed = flb_regex_create(
-            "fluentbit_input_file_bytes_processed_total\\{name=\"tail\\.0\",app=\"app1\",env=\"env2\",instance=\"inst3\"\\} [0-9]+"
+            "fluentbit_input_file_bytes_total\\{name=\"tail\\.0\",status=\"processed\",app=\"app1\",env=\"env2\",instance=\"inst3\"\\} [0-9]+"
         );
         TEST_ASSERT(re_processed != NULL);
         ok_processed = flb_regex_match(re_processed, payload, payload_size);
@@ -259,7 +259,7 @@ static void test_tail_metrics_labels()
 
         /* abandoned bytes metric (may be zero) with labels present */
         re_abandoned = flb_regex_create(
-            "fluentbit_input_file_bytes_abandoned_total\\{name=\"tail\\.0\",app=\"app1\",env=\"env2\",instance=\"inst3\"\\} [0-9]+"
+            "fluentbit_input_file_bytes_total\\{name=\"tail\\.0\",status=\"abandoned\",app=\"app1\",env=\"env2\",instance=\"inst3\"\\} [0-9]+"
         );
         TEST_ASSERT(re_abandoned != NULL);
         ok_abandoned = flb_regex_match(re_abandoned, payload, payload_size);

@@ -480,8 +480,8 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                                                 "Total number of rotated files",
                                                 1, (char *[]) {"name"});
 
-    /* Calculate dynamic label count for abandoned file metrics */
-    int label_count = 1;  /* Always include "name" label */
+    /* Calculate dynamic label count for file bytes metrics */
+    int label_count = 2;  /* Always include "name" and "status" labels */
     int label_i = 0;
     char **label_names = NULL;
 
@@ -508,7 +508,8 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
         flb_tail_config_destroy(ctx);
         return NULL;
     }
-    label_names[label_i++] = "name";  /* First label is always "name" */
+    label_names[label_i++] = "name";    /* First label is always "name" */
+    label_names[label_i++] = "status";  /* Second label is always "status" */
 
 #ifdef FLB_HAVE_REGEX
     if (ctx->tag_regex_labels && mk_list_size(ctx->tag_regex_labels) > 0) {
@@ -528,19 +529,12 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                                                "fluentbit", "input",
                                                "files_abandoned_total",
                                                "Total number of abandoned log files",
-                                               label_count, label_names);
+                                               label_count - 1, label_names);  /* exclude status label for files metric */
 
-    ctx->cmt_bytes_abandoned = cmt_counter_create(ins->cmt,
+    ctx->cmt_file_bytes_total = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
-                                               "file_bytes_abandoned_total",
-                                               "Total number of pending bytes in abandoned log files",
-                                               label_count, label_names);
-
-    /* Note: The stock fluentbit_input_bytes_total metric is based on msgpack bytes */
-    ctx->cmt_bytes_processed = cmt_counter_create(ins->cmt,
-                                               "fluentbit", "input",
-                                               "file_bytes_processed_total",
-                                               "Total number of processed bytes in log files. Based on file offsets, not msgpack bytes.",
+                                               "file_bytes_total",
+                                               "Total number of bytes in log files. Based on file offsets, not msgpack bytes.",
                                                label_count, label_names);
 
     /* Cache the exact label count used at creation time to ensure
@@ -551,8 +545,8 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
     flb_free(label_names);
 
     /* Ensure counters were created successfully */
-    if (!ctx->cmt_files_abandoned || !ctx->cmt_bytes_abandoned || !ctx->cmt_bytes_processed) {
-        flb_plg_error(ctx->ins, "could not create tail abandoned file metrics");
+    if (!ctx->cmt_files_abandoned || !ctx->cmt_file_bytes_total) {
+        flb_plg_error(ctx->ins, "could not create tail file metrics");
         flb_tail_config_destroy(ctx);
         return NULL;
     }
