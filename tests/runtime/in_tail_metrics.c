@@ -400,9 +400,11 @@ static void test_tail_metrics_abandoned_files_closed()
                 continue;
             }
 
-            /* files closed metric with status="abandoned" and labels present */
+            /* files closed metric with status="abandoned" and labels present.
+             * The value regex [1-9][0-9]* asserts the counter is non-zero.
+             */
             re_files_closed_abandoned = flb_regex_create(
-                "fluentbit_input_files_closed_total\\{name=\"tail\\.0\",status=\"abandoned\",app=\"app1\",env=\"env2\",instance=\"inst3\"\\} [0-9]+"
+                "fluentbit_input_files_closed_total\\{name=\"tail\\.0\",status=\"abandoned\",app=\"app1\",env=\"env2\",instance=\"inst3\"\\} [1-9][0-9]*"
             );
             TEST_ASSERT(re_files_closed_abandoned != NULL);
             ok_files_closed_abandoned = flb_regex_match(re_files_closed_abandoned, payload, payload_size);
