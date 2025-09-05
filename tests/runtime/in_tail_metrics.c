@@ -115,6 +115,7 @@ static int fetch_metrics(struct http_client_ctx *http_ctx, int port,
 
 static int pick_free_port()
 {
+    int base;
     int sockfd;
     int yes = 1;
     struct sockaddr_in addr;
@@ -139,7 +140,7 @@ static int pick_free_port()
     }
 
     /* Fallback: scan a small range of fixed ports */
-    for (int base = 2021; base < 2100; base++) {
+    for (base = 2021; base < 2100; base++) {
         int s = socket(AF_INET, SOCK_STREAM, 0);
         if (s < 0) {
             continue;

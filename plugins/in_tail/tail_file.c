@@ -1378,6 +1378,7 @@ void flb_tail_file_remove(struct flb_tail_file *file)
     /* old api */
     flb_metrics_sum(FLB_TAIL_METRIC_F_CLOSED, 1, ctx->ins->metrics);
 
+    int i;
     /* Create label values for file metrics
      * Use the cached label count computed at init time to ensure consistency
      * with the metric schema used during cmt_counter_create(). We keep a fixed
@@ -1394,7 +1395,7 @@ void flb_tail_file_remove(struct flb_tail_file *file)
 
     /* Index 1 (status) is set ahead of metric emission */
     /* Initialize all other labels to default "_" */
-    for (int i = 2; i < label_count; i++) {
+    for (i = 2; i < label_count; i++) {
         label_values[i] = underscore;
     }
 
@@ -1476,7 +1477,7 @@ void flb_tail_file_remove(struct flb_tail_file *file)
 
     /* Free allocated label values (but not the first one which is just a reference) */
 #ifdef FLB_HAVE_REGEX
-    for (int i = 2; i < label_count; i++) {
+    for (i = 2; i < label_count; i++) {
         if (label_values[i] && label_values[i] != underscore) {
             flb_free(label_values[i]);
         }
