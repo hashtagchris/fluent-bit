@@ -225,17 +225,18 @@ static void test_tail_metrics_labels()
         TEST_ASSERT(started == FLB_TRUE);
     }
 
-    /* Give Tail time to read and then remove the file to trigger metrics update */
+    /* Create and unlink the file to trigger close/metrics; the polling loop
+     * below handles readiness. Short sleeps only aid discovery, not correctness. */
     flb_time_msleep(500);
     unlink(file);
 
-    /* Wait for a scan cycle */
+    /* Brief pause to allow scan/close to occur before polling */
     flb_time_msleep(1500);
 
     http_ctx = http_client_ctx_create(http_port);
     TEST_ASSERT(http_ctx != NULL);
 
-    /* Retry loop until the metrics are available */
+    /* Poll the Prometheus endpoint until the expected counters appear */
     for (attempts = 0; attempts < max_attempts; attempts++) {
         char *payload = NULL;
         size_t payload_size = 0;
@@ -289,8 +290,152 @@ static void test_tail_metrics_labels()
     flb_destroy(ctx);
 }
 
+static void test_tail_metrics_abandoned_files_closed()
+{
+    int http_port = 0;
+    const char *file = "app1_env2_inst3.log";
+    const char *msg  = "hello metrics line that repeats to make size larger\n";
+    FILE *fp;
+    int in_ffd;
+    int ret;
+    flb_ctx_t *ctx;
+    struct http_client_ctx *http_ctx = NULL;
+
+    /* Start Fluent Bit first, then create the file so it is discovered post-start */
+    {
+        int attempt;
+        char port_buf[16];
+        const int max_attempts = 10;
+        int started = FLB_FALSE;
+
+        for (attempt = 0; attempt < max_attempts; attempt++) {
+            http_port = pick_free_port();
+            TEST_ASSERT(http_port > 0);
+
+            ctx = flb_create();
+            TEST_ASSERT(ctx != NULL);
+
+            snprintf(port_buf, sizeof(port_buf), "%d", http_port);
+            TEST_ASSERT(flb_service_set(ctx,
+                                        "HTTP_Server", "On",
+                                        "HTTP_Listen", "127.0.0.1",
+                                        "HTTP_Port", port_buf,
+                                        NULL) == 0);
+
+            /* Tail input */
+            in_ffd = flb_input(ctx, "tail", NULL);
+            TEST_ASSERT(in_ffd >= 0);
+
+            /* Configure Tail to discover file after start and keep pending bytes on delete */
+            /*
+             * Force the "abandoned" closure path deterministically:
+             * - refresh_interval: fast discovery (seconds.nanoseconds format)
+             * - buffer_* = 1: any line is "too long" so Tail logs "Skipping file"
+             *   and removes it. Since no bytes were consumed, pending_bytes > 0,
+             *   which marks files_closed_total{status="abandoned"}.
+             * - static_batch_size: irrelevant here but kept tiny to avoid work if
+             *   buffer settings change later.
+             * - rotate_wait: low, though not relied upon since removal is immediate.
+             */
+            ret = flb_input_set(ctx, in_ffd,
+                                "path", file,
+                                "tag", "<app>.<env>.<instance>",
+                                "tag_regex", "(?<app>[a-z0-9]+)_(?<env>[a-z0-9]+)_(?<instance>[a-z0-9]+)\\.log",
+                                "tag_regex_labels", "app,env,instance",
+                                "refresh_interval", "0.200000000",
+                                "buffer_chunk_size", "1",
+                                "buffer_max_size", "1",
+                                "static_batch_size", "1",
+                                "rotate_wait", "1",
+                                NULL);
+            TEST_ASSERT(ret == 0);
+
+            /* Start engine */
+            ret = flb_start(ctx);
+            if (ret == 0) {
+                started = FLB_TRUE;
+                break;
+            }
+
+            flb_destroy(ctx);
+        }
+
+        TEST_ASSERT(started == FLB_TRUE);
+    }
+
+    /* Create the file after the engine is running so it's discovered by the scanner */
+    fp = fopen(file, "w");
+    TEST_ASSERT(fp != NULL);
+    /*
+     * One line is enough: with buffer_max_size=1 the first read triggers the
+     * "requires a larger buffer size" error path and removal with pending bytes.
+     */
+    fwrite(msg, 1, strlen(msg), fp);
+    fflush(fp);
+    fclose(fp);
+
+    /* Allow a quick scan cycle to pick up the file */
+    flb_time_msleep(300);
+
+    /* Delete the file to trigger purge and removal with pending bytes */
+    unlink(file);
+
+    /* No extra wait: rely on the fetch loop below */
+
+    http_ctx = http_client_ctx_create(http_port);
+    TEST_ASSERT(http_ctx != NULL);
+
+    /* Retry loop until the abandoned files_closed metric is available */
+    {
+        int attempts, max_attempts = 60;
+        int ok_files_closed_abandoned = FLB_FALSE;
+
+        for (attempts = 0; attempts < max_attempts; attempts++) {
+            char *payload = NULL;
+            size_t payload_size = 0;
+            struct flb_regex *re_files_closed_abandoned;
+
+            if (fetch_metrics(http_ctx, http_port, &payload, &payload_size) != 0) {
+                flb_time_msleep(50);
+                continue;
+            }
+
+            /* files closed metric with status="abandoned" and labels present */
+            re_files_closed_abandoned = flb_regex_create(
+                "fluentbit_input_files_closed_total\\{name=\"tail\\.0\",status=\"abandoned\",app=\"app1\",env=\"env2\",instance=\"inst3\"\\} [0-9]+"
+            );
+            TEST_ASSERT(re_files_closed_abandoned != NULL);
+            ok_files_closed_abandoned = flb_regex_match(re_files_closed_abandoned, payload, payload_size);
+            flb_regex_destroy(re_files_closed_abandoned);
+
+            if (ok_files_closed_abandoned) {
+                break;
+            }
+
+            flb_time_msleep(50);
+        }
+
+        if (!ok_files_closed_abandoned) {
+            char *payload = NULL;
+            size_t payload_size = 0;
+            if (fetch_metrics(http_ctx, http_port, &payload, &payload_size) == 0 && payload && payload_size > 0) {
+                size_t dump = payload_size < 4096 ? payload_size : 4096;
+                fwrite(payload, 1, dump, stdout);
+            }
+        }
+        TEST_ASSERT(ok_files_closed_abandoned == FLB_TRUE);
+    }
+
+    http_client_ctx_destroy(http_ctx);
+
+    /* Stop engine and cleanup */
+    flb_stop(ctx);
+    flb_destroy(ctx);
+}
+
 /* Test list */
 TEST_LIST = {
     {"tail_metrics_labels", test_tail_metrics_labels},
+    {"tail_metrics_abandoned_files_closed", test_tail_metrics_abandoned_files_closed},
     {NULL, NULL},
 };
