@@ -468,19 +468,13 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                                                "Total number of opened files",
                                                1, (char *[]) {"name"});
 
-    ctx->cmt_files_closed = cmt_counter_create(ins->cmt,
-                                               "fluentbit", "input",
-                                               "files_closed_total",
-                                               "Total number of closed files",
-                                               1, (char *[]) {"name"});
-
     ctx->cmt_files_rotated = cmt_counter_create(ins->cmt,
                                                 "fluentbit", "input",
                                                 "files_rotated_total",
                                                 "Total number of rotated files",
                                                 1, (char *[]) {"name"});
 
-    /* Calculate dynamic label count for file bytes metrics */
+    /* Calculate dynamic label count for files closed and file bytes metrics */
     int label_count = 2;  /* Always include "name" and "status" labels */
     int label_i = 0;
     char **label_names = NULL;
@@ -525,11 +519,11 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
     }
 #endif
 
-    ctx->cmt_files_abandoned = cmt_counter_create(ins->cmt,
+    ctx->cmt_files_closed = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
-                                               "files_abandoned_total",
-                                               "Total number of abandoned log files",
-                                               label_count - 1, label_names);  /* exclude status label for files metric */
+                                               "files_closed_total",
+                                               "Total number of closed files",
+                                               label_count, label_names);
 
     ctx->cmt_file_bytes_total = cmt_counter_create(ins->cmt,
                                                "fluentbit", "input",
@@ -539,13 +533,13 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
 
     /* Cache the exact label count used at creation time to ensure
      * runtime updates always pass a matching schema. */
-    ctx->abandoned_label_count = label_count;
+    ctx->closed_label_count = label_count;
 
     /* Free the dynamically allocated label_names array (but not the strings) */
     flb_free(label_names);
 
     /* Ensure counters were created successfully */
-    if (!ctx->cmt_files_abandoned || !ctx->cmt_file_bytes_total) {
+    if (!ctx->cmt_files_closed || !ctx->cmt_file_bytes_total) {
         flb_plg_error(ctx->ins, "could not create tail file metrics");
         flb_tail_config_destroy(ctx);
         return NULL;
