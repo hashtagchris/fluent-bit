@@ -1382,16 +1382,19 @@ void flb_tail_file_remove(struct flb_tail_file *file)
      * Use the cached label count computed at init time to ensure consistency
      * with the metric schema used during cmt_counter_create(). We keep a fixed
      * stack array sized by the configured maximum number of dynamic labels. */
-    int label_count = ctx->closed_label_count > 0 ? ctx->closed_label_count : 2;
+    int label_count = ctx->closed_label_count >= 2 ? ctx->closed_label_count : 2;
     char *labels_stack[2 + FLB_TAIL_REGEX_LABELS_MAX];
     char **label_values = labels_stack;
+    char *status_processed = "processed";
+    char *status_abandoned = "abandoned";
     char *underscore = "_";
 
     /* Always include instance name as first label value */
     label_values[0] = name;
 
-    /* Initialize all labels to default "_" */
-    for (int i = 1; i < label_count; i++) {
+    /* Index 1 (status) is set ahead of metric emission */
+    /* Initialize all other labels to default "_" */
+    for (int i = 2; i < label_count; i++) {
         label_values[i] = underscore;
     }
 
@@ -1414,7 +1417,7 @@ void flb_tail_file_remove(struct flb_tail_file *file)
             if (ht) {
                 flb_regex_parse(ctx->tag_regex, &result, cb_results, ht);
 
-                /* Extract label values from regex captures 
+                /* Extract label values from regex captures
                  * Start at index 2 to skip "name" and "status" labels */
                 int i = 2;
                 mk_list_foreach(head, ctx->tag_regex_labels) {
@@ -1448,11 +1451,11 @@ void flb_tail_file_remove(struct flb_tail_file *file)
      */
     if (ctx->cmt_file_bytes_total) {
         /* Record processed bytes with status="processed" */
-        label_values[1] = "processed";
+        label_values[1] = status_processed;
         cmt_counter_add(ctx->cmt_file_bytes_total, ts, file->offset, label_count, label_values);
-        
+
         /* Record abandoned bytes with status="abandoned" */
-        label_values[1] = "abandoned";
+        label_values[1] = status_abandoned;
         cmt_counter_add(ctx->cmt_file_bytes_total, ts, file->pending_bytes, label_count, label_values);
     }
 
@@ -1463,13 +1466,12 @@ void flb_tail_file_remove(struct flb_tail_file *file)
     if (ctx->cmt_files_closed) {
         if (file->pending_bytes > 0) {
             /* File was abandoned - has unprocessed data */
-            label_values[1] = "abandoned";
-            cmt_counter_inc(ctx->cmt_files_closed, ts, label_count, label_values);
+            label_values[1] = status_abandoned;
         } else {
             /* File was fully processed */
-            label_values[1] = "processed";
-            cmt_counter_inc(ctx->cmt_files_closed, ts, label_count, label_values);
+            label_values[1] = status_processed;
         }
+        cmt_counter_inc(ctx->cmt_files_closed, ts, label_count, label_values);
     }
 
     /* Free allocated label values (but not the first one which is just a reference) */
