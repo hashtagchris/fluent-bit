@@ -241,8 +241,10 @@ static void test_tail_metrics_labels()
         size_t payload_size = 0;
         struct flb_regex *re_processed;
         struct flb_regex *re_abandoned;
+        struct flb_regex *re_files_closed;
         int ok_processed = FLB_FALSE;
         int ok_abandoned = FLB_FALSE;
+        int ok_files_closed = FLB_FALSE;
 
         if (fetch_metrics(http_ctx, http_port, &payload, &payload_size) != 0) {
             flb_time_msleep(100);
@@ -265,7 +267,15 @@ static void test_tail_metrics_labels()
         ok_abandoned = flb_regex_match(re_abandoned, payload, payload_size);
         flb_regex_destroy(re_abandoned);
 
-        if (ok_processed && ok_abandoned) {
+        /* files closed metric with status="processed" and labels present */
+        re_files_closed = flb_regex_create(
+            "fluentbit_input_files_closed_total\\{name=\"tail\\.0\",status=\"processed\",app=\"app1\",env=\"env2\",instance=\"inst3\"\\} [0-9]+"
+        );
+        TEST_ASSERT(re_files_closed != NULL);
+        ok_files_closed = flb_regex_match(re_files_closed, payload, payload_size);
+        flb_regex_destroy(re_files_closed);
+
+        if (ok_processed && ok_abandoned && ok_files_closed) {
             break;
         }
 
