@@ -1374,30 +1374,33 @@ void flb_tail_file_remove(struct flb_tail_file *file)
 #ifdef FLB_HAVE_METRICS
     name = (char *) flb_input_name(ctx->ins);
     ts = cfl_time_now();
-    cmt_counter_inc(ctx->cmt_files_closed, ts, 1, (char *[]) {name});
 
     /* old api */
     flb_metrics_sum(FLB_TAIL_METRIC_F_CLOSED, 1, ctx->ins->metrics);
 
-    /* Create label values for abandoned file metrics
+    int i;
+    /* Create label values for file metrics
      * Use the cached label count computed at init time to ensure consistency
      * with the metric schema used during cmt_counter_create(). We keep a fixed
      * stack array sized by the configured maximum number of dynamic labels. */
-    int label_count = ctx->abandoned_label_count > 0 ? ctx->abandoned_label_count : 1;
-    char *labels_stack[1 + FLB_TAIL_REGEX_LABELS_MAX];
+    int label_count = ctx->closed_label_count >= 2 ? ctx->closed_label_count : 2;
+    char *labels_stack[2 + FLB_TAIL_REGEX_LABELS_MAX];
     char **label_values = labels_stack;
+    char *status_processed = "processed";
+    char *status_abandoned = "abandoned";
     char *underscore = "_";
 
     /* Always include instance name as first label value */
     label_values[0] = name;
 
-    /* Initialize extra labels to default "_" */
-    for (int i = 1; i < label_count; i++) {
+    /* Index 1 (status) is set ahead of metric emission */
+    /* Initialize all other labels to default "_" */
+    for (i = 2; i < label_count; i++) {
         label_values[i] = underscore;
     }
 
 #ifdef FLB_HAVE_REGEX
-    if (label_count > 1 && ctx->tag_regex && ctx->tag_regex_labels && mk_list_size(ctx->tag_regex_labels) > 0) {
+    if (label_count > 2 && ctx->tag_regex && ctx->tag_regex_labels && mk_list_size(ctx->tag_regex_labels) > 0) {
         ssize_t n;
         struct flb_regex_search result;
         struct flb_hash_table *ht;
@@ -1415,8 +1418,9 @@ void flb_tail_file_remove(struct flb_tail_file *file)
             if (ht) {
                 flb_regex_parse(ctx->tag_regex, &result, cb_results, ht);
 
-                /* Extract label values from regex captures */
-                int i = 1;
+                /* Extract label values from regex captures
+                 * Start at index 2 to skip "name" and "status" labels */
+                int i = 2;
                 mk_list_foreach(head, ctx->tag_regex_labels) {
                     mv = mk_list_entry(head, struct flb_slist_entry, _head);
                     if (mv->str && i < label_count) {
@@ -1446,20 +1450,34 @@ void flb_tail_file_remove(struct flb_tail_file *file)
      * Note: processed bytes are accounted once on file removal using the
      * raw file offset; abandoned bytes may be zero when no pending data.
      */
-    if (ctx->cmt_bytes_processed) {
-        cmt_counter_add(ctx->cmt_bytes_processed, ts, file->offset, label_count, label_values);
-    }
-    if (ctx->cmt_bytes_abandoned) {
-        cmt_counter_add(ctx->cmt_bytes_abandoned, ts, file->pending_bytes, label_count, label_values);
+    if (ctx->cmt_file_bytes_total) {
+        /* Record processed bytes with status="processed" */
+        label_values[1] = status_processed;
+        cmt_counter_add(ctx->cmt_file_bytes_total, ts, file->offset, label_count, label_values);
+
+        /* Record abandoned bytes with status="abandoned" */
+        label_values[1] = status_abandoned;
+        cmt_counter_add(ctx->cmt_file_bytes_total, ts, file->pending_bytes, label_count, label_values);
     }
 
-    if (file->pending_bytes > 0 && ctx->cmt_files_abandoned) {
-        cmt_counter_inc(ctx->cmt_files_abandoned, ts, label_count, label_values);
+    /*
+     * Record files closed with appropriate status.
+     * Files with pending bytes are marked as "abandoned", others as "processed".
+     */
+    if (ctx->cmt_files_closed) {
+        if (file->pending_bytes > 0) {
+            /* File was abandoned - has unprocessed data */
+            label_values[1] = status_abandoned;
+        } else {
+            /* File was fully processed */
+            label_values[1] = status_processed;
+        }
+        cmt_counter_inc(ctx->cmt_files_closed, ts, label_count, label_values);
     }
 
     /* Free allocated label values (but not the first one which is just a reference) */
 #ifdef FLB_HAVE_REGEX
-    for (int i = 1; i < label_count; i++) {
+    for (i = 2; i < label_count; i++) {
         if (label_values[i] && label_values[i] != underscore) {
             flb_free(label_values[i]);
         }
