@@ -104,6 +104,10 @@ flb_sds_t azb_uri_decode(const char *uri, size_t len)
     return out;
 }
 
+/* Azure Blob Storage container name constants */
+#define AZB_CONTAINER_DEFAULT_PREFIX  'c'
+#define AZB_CONTAINER_DEFAULT_NAME    "container"
+
 /*
  * Format container name with tag substitution support
  * Supports $TAG and $TAG[n] placeholders
@@ -216,7 +220,7 @@ flb_sds_t azb_format_container_name(struct flb_azure_blob *ctx, const char *tag)
         i++;
     }
 
-    /* Replace $TAG with the entire tag */
+    /* Replace $TAG with the entire tag (but not $TAG[n] patterns) */
     if (strstr(container_name, "$TAG")) {
         tmp_container = flb_sds_create_size(256);
         if (!tmp_container) {
@@ -226,6 +230,17 @@ flb_sds_t azb_format_container_name(struct flb_azure_blob *ctx, const char *tag)
         const char *pos = container_name;
         const char *found;
         while ((found = strstr(pos, "$TAG")) != NULL) {
+            /* Check if this is $TAG[n] pattern - if so, skip it */
+            if (found[4] == '[') {
+                /* This is $TAG[n], skip over it */
+                tmp_container = flb_sds_cat(tmp_container, pos, (found + 4) - pos);
+                if (!tmp_container) {
+                    goto error;
+                }
+                pos = found + 4;
+                continue;
+            }
+            
             /* Copy everything before the match */
             tmp_container = flb_sds_cat(tmp_container, pos, found - pos);
             if (!tmp_container) {
@@ -291,13 +306,13 @@ flb_sds_t azb_format_container_name(struct flb_azure_blob *ctx, const char *tag)
 
     /* Ensure container name starts with alphanumeric */
     if (j > 0 && result[0] == '-') {
-        result[0] = 'c';  /* Use 'c' as a safe default prefix */
+        result[0] = AZB_CONTAINER_DEFAULT_PREFIX;
     }
 
     /* Ensure minimum length of 3 */
     if (j < 3) {
         flb_sds_destroy(result);
-        result = flb_sds_create("container");  /* Use safe default */
+        result = flb_sds_create(AZB_CONTAINER_DEFAULT_NAME);
     }
 
     /* Ensure maximum length of 63 */

@@ -601,7 +601,7 @@ static int create_container(struct flb_azure_blob *ctx, char *name)
     }
 
     if (c->resp.status == 201) {
-        flb_plg_info(ctx->ins, "container '%s' created sucessfully", name);
+        flb_plg_info(ctx->ins, "container '%s' created successfully", name);
     }
     else {
         if (c->resp.payload_size > 0) {
