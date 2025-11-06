@@ -24,8 +24,13 @@
 #include "azure_blob.h"
 
 flb_sds_t azb_block_blob_blocklist_uri(struct flb_azure_blob *ctx, char *name);
+flb_sds_t azb_block_blob_blocklist_uri_with_tag(struct flb_azure_blob *ctx, const char *tag, char *name);
 flb_sds_t azb_block_blob_uri(struct flb_azure_blob *ctx, char *tag, char *blockid,
                              uint64_t ms, char *random_str);
+flb_sds_t azb_block_blob_uri_with_tag(struct flb_azure_blob *ctx, const char *tag, char *name,
+                                     char *blockid, uint64_t ms, char *random_str);
+flb_sds_t azb_block_blob_uri_commit_with_tag(struct flb_azure_blob *ctx,
+                                             const char *tag, char *blob_name, uint64_t ms, char *str);
 char *azb_block_blob_id_logs(uint64_t *ms);
 char *azb_block_blob_id_blob(struct flb_azure_blob *ctx, char *path, uint64_t part_id);
 

@@ -55,6 +55,30 @@ flb_sds_t azb_block_blob_blocklist_uri(struct flb_azure_blob *ctx, char *name)
     return uri;
 }
 
+flb_sds_t azb_block_blob_blocklist_uri_with_tag(struct flb_azure_blob *ctx, const char *tag, char *name)
+{
+    flb_sds_t uri;
+
+    uri = azb_uri_container_with_tag(ctx, tag);
+    if (!uri) {
+        return NULL;
+    }
+
+    if (ctx->path) {
+        flb_sds_printf(&uri, "/%s/%s?comp=blocklist",
+                       ctx->path, name);
+    }
+    else {
+        flb_sds_printf(&uri, "/%s?comp=blocklist", name);
+    }
+
+    if (ctx->atype == AZURE_BLOB_AUTH_SAS && ctx->sas_token) {
+        flb_sds_printf(&uri, "&%s", ctx->sas_token);
+    }
+
+    return uri;
+}
+
 flb_sds_t azb_block_blob_uri(struct flb_azure_blob *ctx, char *name,
                              char *blockid, uint64_t ms, char *random_str)
 {
@@ -70,6 +94,62 @@ flb_sds_t azb_block_blob_uri(struct flb_azure_blob *ctx, char *name,
     }
 
     uri = azb_uri_container(ctx);
+    if (!uri) {
+        flb_sds_destroy(encoded_blockid);
+        return NULL;
+    }
+
+    if (ctx->compress_blob == FLB_TRUE) {
+        ext = ".gz";
+    }
+    else {
+        ext = "";
+    }
+
+    if (ctx->path) {
+        if (ms > 0) {
+            flb_sds_printf(&uri, "/%s/%s.%s.%" PRIu64 "%s?blockid=%s&comp=block",
+                    ctx->path, name, random_str, ms, ext, encoded_blockid);
+        }
+        else {
+            flb_sds_printf(&uri, "/%s/%s.%s%s?blockid=%s&comp=block",
+                    ctx->path, name, random_str, ext, encoded_blockid);
+        }
+    }
+    else {
+        if (ms > 0) {
+            flb_sds_printf(&uri, "/%s.%s.%" PRIu64 "%s?blockid=%s&comp=block",
+                    name, random_str, ms, ext, encoded_blockid);
+        }
+        else {
+            flb_sds_printf(&uri, "/%s.%s%s?blockid=%s&comp=block",
+                    name, random_str, ext, encoded_blockid);
+        }
+    }
+
+    if (ctx->atype == AZURE_BLOB_AUTH_SAS && ctx->sas_token) {
+        flb_sds_printf(&uri, "&%s", ctx->sas_token);
+    }
+
+    flb_sds_destroy(encoded_blockid);
+    return uri;
+}
+
+flb_sds_t azb_block_blob_uri_with_tag(struct flb_azure_blob *ctx, const char *tag, char *name,
+                                     char *blockid, uint64_t ms, char *random_str)
+{
+    int len;
+    flb_sds_t uri;
+    char *ext;
+    char *encoded_blockid;
+
+    len = strlen(blockid);
+    encoded_blockid = azb_uri_encode(blockid, len);
+    if (!encoded_blockid) {
+        return NULL;
+    }
+
+    uri = azb_uri_container_with_tag(ctx, tag);
     if (!uri) {
         flb_sds_destroy(encoded_blockid);
         return NULL;
@@ -135,6 +215,39 @@ flb_sds_t azb_block_blob_uri_commit(struct flb_azure_blob *ctx,
     }
     else {
         flb_sds_printf(&uri, "/%s.%s.%" PRIu64 "%s?comp=blocklist", tag, str, ms, ext);
+    }
+
+    if (ctx->atype == AZURE_BLOB_AUTH_SAS && ctx->sas_token) {
+        flb_sds_printf(&uri, "&%s", ctx->sas_token);
+    }
+
+    return uri;
+}
+
+flb_sds_t azb_block_blob_uri_commit_with_tag(struct flb_azure_blob *ctx,
+                                             const char *tag, char *blob_name, uint64_t ms, char *str)
+{
+    char *ext;
+    flb_sds_t uri;
+
+    uri = azb_uri_container_with_tag(ctx, tag);
+    if (!uri) {
+        return NULL;
+    }
+
+    if (ctx->compress_blob == FLB_TRUE) {
+        ext = ".gz";
+    }
+    else {
+        ext = "";
+    }
+
+    if (ctx->path) {
+        flb_sds_printf(&uri, "/%s/%s.%s.%" PRIu64 "%s?comp=blocklist", ctx->path, blob_name, str,
+                ms, ext);
+    }
+    else {
+        flb_sds_printf(&uri, "/%s.%s.%" PRIu64 "%s?comp=blocklist", blob_name, str, ms, ext);
     }
 
     if (ctx->atype == AZURE_BLOB_AUTH_SAS && ctx->sas_token) {

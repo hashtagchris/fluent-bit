@@ -46,3 +46,26 @@ flb_sds_t azb_append_blob_uri(struct flb_azure_blob *ctx, char *tag)
 
     return uri;
 }
+
+flb_sds_t azb_append_blob_uri_with_tag(struct flb_azure_blob *ctx, const char *tag, const char *blob_name)
+{
+    flb_sds_t uri;
+
+    uri = azb_uri_container_with_tag(ctx, tag);
+    if (!uri) {
+        return NULL;
+    }
+
+    if (ctx->path) {
+        flb_sds_printf(&uri, "/%s/%s?comp=appendblock", ctx->path, blob_name);
+    }
+    else {
+        flb_sds_printf(&uri, "/%s?comp=appendblock", blob_name);
+    }
+
+    if (ctx->atype == AZURE_BLOB_AUTH_SAS && ctx->sas_token) {
+        flb_sds_printf(&uri, "&%s", ctx->sas_token);
+    }
+
+    return uri;
+}

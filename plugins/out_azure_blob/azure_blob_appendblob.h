@@ -24,5 +24,6 @@
 #include "azure_blob.h"
 
 flb_sds_t azb_append_blob_uri(struct flb_azure_blob *ctx, char *tag);
+flb_sds_t azb_append_blob_uri_with_tag(struct flb_azure_blob *ctx, const char *tag, const char *blob_name);
 
 #endif
