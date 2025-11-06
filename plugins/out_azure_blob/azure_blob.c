@@ -1676,7 +1676,15 @@ static void cb_azure_blob_flush(struct flb_event_chunk *event_chunk,
                 *
                 * https://learn.microsoft.com/en-us/azure/storage/blobs/storage-blob-container-create#about-container-naming
                 */
-                ret = ensure_container(ctx);
+                if (strstr(ctx->container_name, "$TAG")) {
+                    /* Container name has dynamic placeholders, use tag-aware version */
+                    ret = ensure_container_with_tag(ctx, tag_name, NULL);
+                }
+                else {
+                    /* Container name is static */
+                    ret = ensure_container(ctx);
+                }
+                
                 if (ret == FLB_FALSE) {
                     FLB_OUTPUT_RETURN(FLB_RETRY);
                 }
@@ -1751,7 +1759,15 @@ static void cb_azure_blob_flush(struct flb_event_chunk *event_chunk,
             *
             * https://learn.microsoft.com/en-us/azure/storage/blobs/storage-blob-container-create#about-container-naming
             */
-            ret = ensure_container(ctx);
+            if (strstr(ctx->container_name, "$TAG")) {
+                /* Container name has dynamic placeholders, use tag-aware version */
+                ret = ensure_container_with_tag(ctx, event_chunk->tag, NULL);
+            }
+            else {
+                /* Container name is static */
+                ret = ensure_container(ctx);
+            }
+            
             if (ret == FLB_FALSE) {
                 FLB_OUTPUT_RETURN(FLB_RETRY);
             }
@@ -1891,7 +1907,9 @@ static struct flb_config_map config_map[] = {
     {
      FLB_CONFIG_MAP_STR, "container_name", NULL,
      0, FLB_TRUE, offsetof(struct flb_azure_blob, container_name),
-     "Container name (mandatory)"
+     "Container name (mandatory). Supports dynamic values using $TAG for the full tag, "
+     "$TAG[n] for tag parts (where n is 0-9), split by delimiters (. - _). "
+     "For example: 'logs-$TAG[0]' or 'container-$TAG'"
     },
 
     {

@@ -404,7 +404,14 @@ flb_sds_t azb_uri_create_blob(struct flb_azure_blob *ctx, char *tag)
 {
     flb_sds_t uri;
 
-    uri = azb_uri_container(ctx);
+    /* Check if container name has dynamic placeholders */
+    if (strstr(ctx->container_name, "$TAG")) {
+        uri = azb_uri_container_with_tag(ctx, tag);
+    }
+    else {
+        uri = azb_uri_container(ctx);
+    }
+    
     if (!uri) {
         return NULL;
     }

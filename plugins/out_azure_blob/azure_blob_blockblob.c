@@ -35,7 +35,14 @@ flb_sds_t azb_block_blob_blocklist_uri(struct flb_azure_blob *ctx, char *name)
 {
     flb_sds_t uri;
 
-    uri = azb_uri_container(ctx);
+    /* Check if container name has dynamic placeholders */
+    if (strstr(ctx->container_name, "$TAG")) {
+        uri = azb_uri_container_with_tag(ctx, name);
+    }
+    else {
+        uri = azb_uri_container(ctx);
+    }
+    
     if (!uri) {
         return NULL;
     }
@@ -93,7 +100,14 @@ flb_sds_t azb_block_blob_uri(struct flb_azure_blob *ctx, char *name,
         return NULL;
     }
 
-    uri = azb_uri_container(ctx);
+    /* Check if container name has dynamic placeholders */
+    if (strstr(ctx->container_name, "$TAG")) {
+        uri = azb_uri_container_with_tag(ctx, name);
+    }
+    else {
+        uri = azb_uri_container(ctx);
+    }
+    
     if (!uri) {
         flb_sds_destroy(encoded_blockid);
         return NULL;
@@ -197,7 +211,14 @@ flb_sds_t azb_block_blob_uri_commit(struct flb_azure_blob *ctx,
     char *ext;
     flb_sds_t uri;
 
-    uri = azb_uri_container(ctx);
+    /* Check if container name has dynamic placeholders */
+    if (strstr(ctx->container_name, "$TAG")) {
+        uri = azb_uri_container_with_tag(ctx, tag);
+    }
+    else {
+        uri = azb_uri_container(ctx);
+    }
+    
     if (!uri) {
         return NULL;
     }
