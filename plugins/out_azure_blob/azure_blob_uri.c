@@ -143,7 +143,10 @@ flb_sds_t azb_format_container_name(struct flb_azure_blob *ctx, const char *tag)
         return NULL;
     }
 
-    /* Split the tag on delimiters */
+    /* 
+     * Split the tag on delimiters 
+     * Note: strtok_r modifies tmp_tag, which is why we created a copy above
+     */
     tag_token = strtok_r(tmp_tag, tag_delimiters, &strtok_saveptr);
 
     /* Replace $TAG[n] with the appropriate tag part */
@@ -319,6 +322,7 @@ flb_sds_t azb_format_container_name(struct flb_azure_blob *ctx, const char *tag)
     if (j > 63) {
         result[63] = '\0';
         flb_sds_len_set(result, 63);
+        j = 63;
     }
 
     flb_sds_destroy(tmp_tag);
