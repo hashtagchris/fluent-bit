@@ -43,6 +43,8 @@
 #define FLB_TAIL_METRIC_F_OPENED  100  /* number of opened files  */
 #define FLB_TAIL_METRIC_F_CLOSED  101  /* number of closed files  */
 #define FLB_TAIL_METRIC_F_ROTATED 102  /* number of rotated files */
+#define FLB_TAIL_METRIC_M_TRUNCATED 103  /* number of truncated occurrences of multiline */
+#define FLB_TAIL_METRIC_L_TRUNCATED 104  /* number of truncated occurrences of long lines */
 #endif
 
 struct flb_tail_config {
@@ -55,6 +57,7 @@ struct flb_tail_config {
     /* Buffer Config */
     size_t buf_chunk_size;     /* allocation chunks        */
     size_t buf_max_size;       /* max size of a buffer     */
+    int    truncate_long_lines; /* truncate long lines after re-encode */
 
     /* Static files processor */
     size_t static_batch_size;
@@ -170,6 +173,8 @@ struct flb_tail_config {
     struct cmt_counter *cmt_files_opened;
     struct cmt_counter *cmt_files_closed;
     struct cmt_counter *cmt_files_rotated;
+    struct cmt_counter *cmt_multiline_truncated;
+    struct cmt_counter *cmt_long_line_truncated;
     struct cmt_counter *cmt_file_bytes_total;
 
     /* Cached number of labels used for file closed metrics */

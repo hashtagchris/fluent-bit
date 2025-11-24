@@ -109,10 +109,10 @@ static void append_headers(struct flb_http_client *c,
     }
 }
 
-static int http_post(struct flb_out_http *ctx,
-                     const void *body, size_t body_len,
-                     const char *tag, int tag_len,
-                     char **headers)
+static int http_request(struct flb_out_http *ctx,
+                        const void *body, size_t body_len,
+                        const char *tag, int tag_len,
+                        char **headers)
 {
     int ret = 0;
     int out_ret = FLB_OK;
@@ -173,11 +173,23 @@ static int http_post(struct flb_out_http *ctx,
 
 
     /* Create HTTP client context */
-    c = flb_http_client(u_conn, FLB_HTTP_POST, ctx->uri,
+    c = flb_http_client(u_conn, ctx->http_method, ctx->uri,
                         payload_buf, payload_size,
                         ctx->host, ctx->port,
                         ctx->proxy, 0);
 
+    if (c == NULL) {
+        flb_plg_error(ctx->ins, "[http_client] failed to create HTTP client");
+        if (payload_buf != body) {
+            flb_free(payload_buf);
+        }
+
+        if (u_conn) {
+            flb_upstream_conn_release(u_conn);
+        }
+
+        return FLB_RETRY;
+    }
 
     if (c->proxy.host) {
         flb_plg_debug(ctx->ins, "[http_client] proxy host: %s port: %i",
@@ -192,6 +204,15 @@ static int http_post(struct flb_out_http *ctx,
      * This needs to be improved through a more clean API.
      */
     c->cb_ctx = ctx->ins->callback;
+
+    flb_http_set_response_timeout(c, ctx->response_timeout);
+
+    if (ctx->read_idle_timeout > 0) {
+        flb_http_set_read_idle_timeout(c, ctx->read_idle_timeout);
+    }
+    else {
+        flb_http_set_read_idle_timeout(c, ctx->ins->net_setup.io_timeout);
+    }
 
     /* Append headers */
     if (headers) {
@@ -427,7 +448,8 @@ static int compose_payload_gelf(struct flb_out_http *ctx,
 
 static int compose_payload(struct flb_out_http *ctx,
                            const void *in_body, size_t in_size,
-                           void **out_body, size_t *out_size)
+                           void **out_body, size_t *out_size,
+                           struct flb_config *config)
 {
     flb_sds_t encoded;
 
@@ -442,7 +464,8 @@ static int compose_payload(struct flb_out_http *ctx,
                                                   in_size,
                                                   ctx->out_format,
                                                   ctx->json_date_format,
-                                                  ctx->date_key);
+                                                  ctx->date_key,
+                                                  config->json_escape_unicode);
         if (encoded == NULL) {
             flb_plg_error(ctx->ins, "failed to convert json");
             return FLB_ERROR;
@@ -518,7 +541,7 @@ err:
     return NULL;
 }
 
-static int post_all_requests(struct flb_out_http *ctx,
+static int send_all_requests(struct flb_out_http *ctx,
                              const char *data, size_t size,
                              flb_sds_t body_key,
                              flb_sds_t headers_key,
@@ -587,8 +610,10 @@ static int post_all_requests(struct flb_out_http *ctx,
         }
 
         if (body_found && headers_found) {
-            flb_plg_trace(ctx->ins, "posting record %zu", record_count++);
-            ret = http_post(ctx, body, body_size, event_chunk->tag,
+            flb_plg_trace(ctx->ins, "sending record %zu via %s",
+                          record_count++,
+                          ctx->http_method == FLB_HTTP_POST ? "POST" : "PUT");
+            ret = http_request(ctx, body, body_size, event_chunk->tag,
                     flb_sds_len(event_chunk->tag), headers);
         }
         else {
@@ -620,16 +645,16 @@ static void cb_http_flush(struct flb_event_chunk *event_chunk,
     (void) i_ins;
 
     if (ctx->body_key) {
-        ret = post_all_requests(ctx, event_chunk->data, event_chunk->size,
+        ret = send_all_requests(ctx, event_chunk->data, event_chunk->size,
                                 ctx->body_key, ctx->headers_key, event_chunk);
         if (ret < 0) {
             flb_plg_error(ctx->ins,
-                          "failed to post requests body key \"%s\"", ctx->body_key);
+                          "failed to send requests using body key \"%s\"", ctx->body_key);
         }
     }
     else {
         ret = compose_payload(ctx, event_chunk->data, event_chunk->size,
-                              &out_body, &out_size);
+                              &out_body, &out_size, config);
         if (ret != FLB_OK) {
             FLB_OUTPUT_RETURN(ret);
         }
@@ -638,15 +663,15 @@ static void cb_http_flush(struct flb_event_chunk *event_chunk,
             (ctx->out_format == FLB_PACK_JSON_FORMAT_STREAM) ||
             (ctx->out_format == FLB_PACK_JSON_FORMAT_LINES) ||
             (ctx->out_format == FLB_HTTP_OUT_GELF)) {
-            ret = http_post(ctx, out_body, out_size,
-                            event_chunk->tag, flb_sds_len(event_chunk->tag), NULL);
+            ret = http_request(ctx, out_body, out_size,
+                               event_chunk->tag, flb_sds_len(event_chunk->tag), NULL);
             flb_sds_destroy(out_body);
         }
         else {
             /* msgpack */
-            ret = http_post(ctx,
-                            event_chunk->data, event_chunk->size,
-                            event_chunk->tag, flb_sds_len(event_chunk->tag), NULL);
+            ret = http_request(ctx,
+                               event_chunk->data, event_chunk->size,
+                               event_chunk->tag, flb_sds_len(event_chunk->tag), NULL);
         }
     }
 
@@ -677,6 +702,16 @@ static struct flb_config_map config_map[] = {
      FLB_CONFIG_MAP_BOOL, "log_response_payload", "true",
      0, FLB_TRUE, offsetof(struct flb_out_http, log_response_payload),
      "Specify if the response paylod should be logged or not"
+    },
+    {
+     FLB_CONFIG_MAP_TIME, "http.response_timeout", "60s",
+     0, FLB_TRUE, offsetof(struct flb_out_http, response_timeout),
+     "Set maximum time to wait for a server response"
+    },
+    {
+     FLB_CONFIG_MAP_TIME, "http.read_idle_timeout", "0s",
+     0, FLB_TRUE, offsetof(struct flb_out_http, read_idle_timeout),
+     "Set maximum allowed time between two consecutive reads"
     },
     {
      FLB_CONFIG_MAP_STR, "http_user", NULL,
@@ -738,6 +773,11 @@ static struct flb_config_map config_map[] = {
      0, FLB_TRUE, offsetof(struct flb_out_http, uri),
      "Specify an optional HTTP URI for the target web server, e.g: /something"
     },
+    {
+     FLB_CONFIG_MAP_STR, "http_method", "POST",
+     0, FLB_FALSE, 0,
+     "Specify the HTTP method to use. Supported methods are POST and PUT"
+    },
 
     /* Gelf Properties */
     {
@@ -792,7 +832,7 @@ static int cb_http_format_test(struct flb_config *config,
     struct flb_out_http *ctx = plugin_context;
     int ret;
 
-    ret = compose_payload(ctx, data, bytes, out_data, out_size);
+    ret = compose_payload(ctx, data, bytes, out_data, out_size, config);
     if (ret != FLB_OK) {
         flb_error("ret=%d", ret);
         return -1;

@@ -171,7 +171,7 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
             if (sec == 0 && nsec == 0) {
                 flb_plg_error(ctx->ins, "invalid 'refresh_interval' config "
                               "value (%s)", tmp);
-                flb_free(ctx);
+                flb_tail_config_destroy(ctx);
                 return NULL;
             }
 
@@ -193,7 +193,7 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
     /* Config: seconds interval to monitor file after rotation */
     if (ctx->rotate_wait <= 0) {
         flb_plg_error(ctx->ins, "invalid 'rotate_wait' config value");
-        flb_free(ctx);
+        flb_tail_config_destroy(ctx);
         return NULL;
     }
 
@@ -216,7 +216,7 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
         }
         else {
             flb_plg_error(ctx->ins, "invalid encoding 'unicode.encoding' value");
-            flb_free(ctx);
+            flb_tail_config_destroy(ctx);
             return NULL;
         }
     }
@@ -231,11 +231,20 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
         }
         else {
             flb_plg_error(ctx->ins, "invalid encoding 'generic.encoding' value %s", tmp);
-            flb_free(ctx);
+            flb_tail_config_destroy(ctx);
             return NULL;
         }
     }
 
+#ifdef FLB_HAVE_UNICODE_ENCODER
+    if (ctx->preferred_input_encoding != FLB_UNICODE_ENCODING_UNSPECIFIED &&
+        ctx->generic_input_encoding_type != FLB_GENERIC_UNSPECIFIED) {
+        flb_plg_error(ctx->ins,
+                      "'unicode.encoding' and 'generic.encoding' cannot be specified at the same time");
+        flb_tail_config_destroy(ctx);
+        return NULL;
+    }
+#endif
 #ifdef FLB_HAVE_PARSER
     /* Config: multi-line support */
     if (ctx->multiline == FLB_TRUE) {
@@ -259,7 +268,7 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
     /* Validate buffer limit */
     if (ctx->buf_chunk_size > ctx->buf_max_size) {
         flb_plg_error(ctx->ins, "buffer_max_size must be >= buffer_chunk");
-        flb_free(ctx);
+        flb_tail_config_destroy(ctx);
         return NULL;
     }
 
@@ -474,6 +483,19 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                                                 "Total number of rotated files",
                                                 1, (char *[]) {"name"});
 
+    ctx->cmt_multiline_truncated = \
+            cmt_counter_create(ins->cmt,
+                               "fluentbit", "input",
+                               "multiline_truncated_total",
+                               "Total number of truncated occurences for multilines",
+                               1, (char *[]) {"name"});
+    ctx->cmt_long_line_truncated = \
+            cmt_counter_create(ins->cmt,
+                               "fluentbit", "input",
+                               "long_line_truncated_total",
+                               "Total number of truncated occurences for long lines",
+                               1, (char *[]) {"name"});
+
     /* Calculate dynamic label count for files closed and file bytes metrics */
     int label_count = 2;  /* Always include "name" and "status" labels */
     int label_i = 0;
@@ -552,6 +574,10 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                     "files_closed", ctx->ins->metrics);
     flb_metrics_add(FLB_TAIL_METRIC_F_ROTATED,
                     "files_rotated", ctx->ins->metrics);
+    flb_metrics_add(FLB_TAIL_METRIC_M_TRUNCATED,
+                    "multiline_truncated", ctx->ins->metrics);
+    flb_metrics_add(FLB_TAIL_METRIC_L_TRUNCATED,
+                    "long_line_truncated", ctx->ins->metrics);
 #endif /* FLB_HAVE_METRICS */
 
     return ctx;

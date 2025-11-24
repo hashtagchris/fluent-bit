@@ -25,6 +25,12 @@
 #include <fluent-bit/flb_log_event_decoder.h>
 #include <fluent-bit/flb_log_event_encoder.h>
 
+#define FW_INSTANCE_STATE_RUNNING           0
+#define FW_INSTANCE_STATE_ACCEPTING_CLIENT  1
+#define FW_INSTANCE_STATE_PROCESSING_PACKET 2
+#define FW_INSTANCE_STATE_PAUSED            3
+
+
 enum {
     FW_HANDSHAKE_HELO        = 1,
     FW_HANDSHAKE_PINGPONG    = 2,
@@ -60,7 +66,8 @@ struct flb_in_fw_config {
     flb_sds_t unix_perm_str;        /* Permission (config map)     */
 
     /* secure forward */
-    flb_sds_t shared_key;        /* shared key                   */
+    flb_sds_t shared_key;         /* shared key      */
+    int owns_shared_key;          /* own flag of shared key */
     flb_sds_t self_hostname;     /* hostname used in certificate  */
     struct mk_list users;        /* username and password pairs  */
     int empty_shared_key;        /* use an empty string as shared key */
@@ -75,6 +82,8 @@ struct flb_in_fw_config {
 
     pthread_mutex_t conn_mutex;
 
+    int state;
+    
     /* Plugin is paused */
     int is_paused;
 };
