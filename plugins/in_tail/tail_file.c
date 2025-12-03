@@ -1511,6 +1511,7 @@ void flb_tail_file_remove(struct flb_tail_file *file)
     flb_metrics_sum(FLB_TAIL_METRIC_F_CLOSED, 1, ctx->ins->metrics);
 
     int i;
+    int64_t abandoned_bytes;
     /* Create label values for file metrics
      * Use the cached label count computed at init time to ensure consistency
      * with the metric schema used during cmt_counter_create(). We keep a fixed
@@ -1587,9 +1588,19 @@ void flb_tail_file_remove(struct flb_tail_file *file)
         label_values[1] = status_processed;
         cmt_counter_add(ctx->cmt_file_bytes_total, ts, file->offset, label_count, label_values);
 
+        /*
+         * Work around a bug where file->pending_bytes can be negative.
+         * We've spotted this shortly after startup, so it may be related to stale entries in the sqlite database.
+         */
+        if (file->pending_bytes > 0) {
+            abandoned_bytes = file->pending_bytes;
+        } else {
+            abandoned_bytes = 0;
+        }
+
         /* Record abandoned bytes with status="abandoned" */
         label_values[1] = status_abandoned;
-        cmt_counter_add(ctx->cmt_file_bytes_total, ts, file->pending_bytes, label_count, label_values);
+        cmt_counter_add(ctx->cmt_file_bytes_total, ts, abandoned_bytes, label_count, label_values);
     }
 
     /*
