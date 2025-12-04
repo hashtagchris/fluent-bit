@@ -98,6 +98,9 @@ static int fetch_metrics(struct http_client_ctx *http_ctx, int port,
                                   0);
     TEST_ASSERT(http_client != NULL);
 
+    ret = flb_http_buffer_size(http_client, 8192);
+    TEST_ASSERT(ret == 0);
+
     ret = flb_http_do(http_client, &b_sent);
     TEST_ASSERT(ret == 0);
 
