@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -496,6 +496,13 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                                "Total number of truncated occurences for long lines",
                                1, (char *[]) {"name"});
 
+    ctx->cmt_long_line_skipped =
+            cmt_counter_create(ins->cmt,
+                               "fluentbit", "input",
+                               "long_line_skipped_total",
+                               "Total number of skipped occurences for long lines",
+                               1, (char *[]) {"name"});
+
     /* Calculate dynamic label count for files closed and file bytes metrics */
     int label_count = 2;  /* Always include "name" and "status" labels */
     int label_i = 0;
@@ -578,6 +585,8 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                     "multiline_truncated", ctx->ins->metrics);
     flb_metrics_add(FLB_TAIL_METRIC_L_TRUNCATED,
                     "long_line_truncated", ctx->ins->metrics);
+    flb_metrics_add(FLB_TAIL_METRIC_L_SKIPPED,
+                    "long_line_skipped", ctx->ins->metrics);
 #endif /* FLB_HAVE_METRICS */
 
     return ctx;

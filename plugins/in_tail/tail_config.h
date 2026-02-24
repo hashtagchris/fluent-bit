@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -45,6 +45,7 @@
 #define FLB_TAIL_METRIC_F_ROTATED 102  /* number of rotated files */
 #define FLB_TAIL_METRIC_M_TRUNCATED 103  /* number of truncated occurrences of multiline */
 #define FLB_TAIL_METRIC_L_TRUNCATED 104  /* number of truncated occurrences of long lines */
+#define FLB_TAIL_METRIC_L_SKIPPED 105  /* number of skipped occurrences of long lines */
 #endif
 
 struct flb_tail_config {
@@ -169,16 +170,19 @@ struct flb_tail_config {
     struct flb_log_event_encoder log_event_encoder;
     struct flb_log_event_decoder log_event_decoder;
 
+#ifdef FLB_HAVE_METRICS
     /* Metrics */
     struct cmt_counter *cmt_files_opened;
     struct cmt_counter *cmt_files_closed;
     struct cmt_counter *cmt_files_rotated;
     struct cmt_counter *cmt_multiline_truncated;
     struct cmt_counter *cmt_long_line_truncated;
+    struct cmt_counter *cmt_long_line_skipped;
     struct cmt_counter *cmt_file_bytes_total;
 
     /* Cached number of labels used for file closed metrics */
     int closed_label_count;
+#endif
 
     /* Hash: hash tables for quick acess to registered files */
     struct flb_hash_table *static_hash;

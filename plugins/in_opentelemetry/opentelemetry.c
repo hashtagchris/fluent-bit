@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -211,7 +211,7 @@ static struct flb_config_map config_map[] = {
      "environments"
     },
     {
-     FLB_CONFIG_MAP_BOOL, "encode_profiles_as_log", "true",
+     FLB_CONFIG_MAP_BOOL, "encode_profiles_as_log", "false",
      0, FLB_TRUE, offsetof(struct flb_opentelemetry, encode_profiles_as_log),
      "Encode profiles received as text and ingest them in the logging pipeline"
     },
