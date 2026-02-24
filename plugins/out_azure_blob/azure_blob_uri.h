@@ -25,9 +25,13 @@
 
 #include "azure_blob.h"
 
+flb_sds_t azb_format_container_name(struct flb_azure_blob *ctx, const char *tag);
 flb_sds_t azb_uri_container(struct flb_azure_blob *ctx);
+flb_sds_t azb_uri_container_with_tag(struct flb_azure_blob *ctx, const char *tag);
 flb_sds_t azb_uri_ensure_or_create_container(struct flb_azure_blob *ctx);
+flb_sds_t azb_uri_ensure_or_create_container_with_tag(struct flb_azure_blob *ctx, const char *tag);
 flb_sds_t azb_uri_create_blob(struct flb_azure_blob *ctx, char *tag);
+flb_sds_t azb_uri_create_blob_with_tag(struct flb_azure_blob *ctx, const char *tag, const char *blob_name);
 flb_sds_t azb_uri_encode(const char *uri, size_t len);
 flb_sds_t azb_uri_decode(const char *uri, size_t len);
 

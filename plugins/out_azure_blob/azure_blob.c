@@ -602,7 +602,7 @@ static int create_container(struct flb_azure_blob *ctx, char *name)
     }
 
     if (c->resp.status == 201) {
-        flb_plg_info(ctx->ins, "container '%s' created sucessfully", name);
+        flb_plg_info(ctx->ins, "container '%s' created successfully", name);
     }
     else {
         if (c->resp.payload_size > 0) {
@@ -717,6 +717,133 @@ static int ensure_container(struct flb_azure_blob *ctx)
     flb_plg_error(ctx->ins, "get container request failed, status=%i",
                   status);
 
+    return FLB_FALSE;
+}
+
+/*
+ * Version of ensure_container that supports dynamic container names based on tags
+ */
+static int ensure_container_with_tag(struct flb_azure_blob *ctx, const char *tag, flb_sds_t *out_container_name)
+{
+    int ret;
+    int status;
+    size_t b_sent;
+    flb_sds_t uri;
+    flb_sds_t container_name;
+    struct flb_http_client *c;
+    struct flb_connection *u_conn;
+
+    /* Format the container name with tag substitution */
+    container_name = NULL;
+    if (strstr(ctx->container_name, "$TAG")) {
+        /* Container name has placeholders, format it */
+        container_name = azb_format_container_name(ctx, tag);
+        if (!container_name) {
+            flb_plg_error(ctx->ins, "cannot format container name with tag");
+            return FLB_FALSE;
+        }
+    }
+    else {
+        /* No placeholders, use as-is */
+        container_name = flb_sds_create(ctx->container_name);
+        if (!container_name) {
+            return FLB_FALSE;
+        }
+    }
+
+    /* Return the formatted container name if requested */
+    if (out_container_name) {
+        *out_container_name = flb_sds_create(container_name);
+    }
+
+    if (!ctx->auto_create_container) {
+        flb_plg_info(ctx->ins, "auto_create_container is disabled, assuming container '%s' already exists",
+                     container_name);
+        flb_sds_destroy(container_name);
+        return FLB_TRUE;
+    }
+
+    uri = azb_uri_ensure_or_create_container_with_tag(ctx, tag);
+    if (!uri) {
+        flb_plg_error(ctx->ins, "cannot create container URI");
+        flb_sds_destroy(container_name);
+        return FLB_FALSE;
+    }
+
+    if (ctx->buffering_enabled == FLB_TRUE){
+        ctx->u->base.flags &= ~(FLB_IO_ASYNC);
+        ctx->u->base.net.io_timeout = ctx->io_timeout;
+    }
+
+    /* Get upstream connection */
+    u_conn = flb_upstream_conn_get(ctx->u);
+    if (!u_conn) {
+        flb_plg_error(ctx->ins,
+                      "cannot create upstream connection for container check");
+        flb_sds_destroy(uri);
+        flb_sds_destroy(container_name);
+        return FLB_FALSE;
+    }
+
+    /* Create HTTP client context */
+    c = flb_http_client(u_conn, FLB_HTTP_GET,
+                        uri,
+                        NULL, 0, NULL, 0, NULL, 0);
+    if (!c) {
+        flb_plg_error(ctx->ins, "cannot create HTTP client context");
+        flb_upstream_conn_release(u_conn);
+        flb_sds_destroy(uri);
+        flb_sds_destroy(container_name);
+        return FLB_FALSE;
+    }
+    flb_http_strip_port_from_host(c);
+
+    /* Prepare headers and authentication */
+    azb_http_client_setup(ctx, c, -1, FLB_FALSE,
+                          AZURE_BLOB_CT_NONE, AZURE_BLOB_CE_NONE);
+
+    /* Send HTTP request */
+    ret = flb_http_do(c, &b_sent);
+    flb_sds_destroy(uri);
+
+    if (ret == -1) {
+        flb_plg_error(ctx->ins, "error requesting container properties");
+        flb_upstream_conn_release(u_conn);
+        flb_sds_destroy(container_name);
+        return FLB_FALSE;
+    }
+
+    status = c->resp.status;
+    flb_http_client_destroy(c);
+
+    /* Release connection */
+    flb_upstream_conn_release(u_conn);
+
+    /* Request was successful, validate HTTP status code */
+    if (status == 404) {
+        /* The container was not found, try to create it */
+        flb_plg_info(ctx->ins, "container '%s' not found, trying to create it",
+                     container_name);
+        ret = create_container(ctx, container_name);
+        flb_sds_destroy(container_name);
+        return ret;
+    }
+    else if (status == 200) {
+        flb_plg_info(ctx->ins, "container '%s' already exists", container_name);
+        flb_sds_destroy(container_name);
+        return FLB_TRUE;
+    }
+    else if (status == 403) {
+        flb_plg_error(ctx->ins, "failed getting container '%s', access denied",
+                      container_name);
+        flb_sds_destroy(container_name);
+        return FLB_FALSE;
+    }
+    
+    flb_plg_error(ctx->ins, "get container request failed, status=%i",
+                  status);
+
+    flb_sds_destroy(container_name);
     return FLB_FALSE;
 }
 
@@ -1550,7 +1677,15 @@ static void cb_azure_blob_flush(struct flb_event_chunk *event_chunk,
                 *
                 * https://learn.microsoft.com/en-us/azure/storage/blobs/storage-blob-container-create#about-container-naming
                 */
-                ret = ensure_container(ctx);
+                if (strstr(ctx->container_name, "$TAG")) {
+                    /* Container name has dynamic placeholders, use tag-aware version */
+                    ret = ensure_container_with_tag(ctx, tag_name, NULL);
+                }
+                else {
+                    /* Container name is static */
+                    ret = ensure_container(ctx);
+                }
+                
                 if (ret == FLB_FALSE) {
                     FLB_OUTPUT_RETURN(FLB_RETRY);
                 }
@@ -1625,7 +1760,15 @@ static void cb_azure_blob_flush(struct flb_event_chunk *event_chunk,
             *
             * https://learn.microsoft.com/en-us/azure/storage/blobs/storage-blob-container-create#about-container-naming
             */
-            ret = ensure_container(ctx);
+            if (strstr(ctx->container_name, "$TAG")) {
+                /* Container name has dynamic placeholders, use tag-aware version */
+                ret = ensure_container_with_tag(ctx, event_chunk->tag, NULL);
+            }
+            else {
+                /* Container name is static */
+                ret = ensure_container(ctx);
+            }
+            
             if (ret == FLB_FALSE) {
                 FLB_OUTPUT_RETURN(FLB_RETRY);
             }
@@ -1765,7 +1908,9 @@ static struct flb_config_map config_map[] = {
     {
      FLB_CONFIG_MAP_STR, "container_name", NULL,
      0, FLB_TRUE, offsetof(struct flb_azure_blob, container_name),
-     "Container name (mandatory)"
+     "Container name (mandatory). Supports dynamic values using $TAG for the full tag, "
+     "$TAG[n] for tag parts (where n is 0-9), split by delimiters (. - _). "
+     "For example: 'logs-$TAG[0]' or 'container-$TAG'"
     },
 
     {
