@@ -3388,8 +3388,8 @@ static int input_chunk_append_raw(struct flb_input_instance *in,
         real_diff = 0;
     }
 
-    /* Lock buffers where size > 2MB */
-    if (content_size > FLB_INPUT_CHUNK_FS_MAX_SIZE) {
+    /* Lock buffers that have crossed the configured soft size limit */
+    if (content_size > in->storage_max_chunk_size) {
         cio_chunk_lock(ic->chunk);
     }
 
@@ -3456,8 +3456,9 @@ static int input_chunk_append_raw(struct flb_input_instance *in,
             content_size = cio_chunk_get_content_size(ic->chunk);
 
             /* Do we have less than 1% available ? */
-            min = (FLB_INPUT_CHUNK_FS_MAX_SIZE * 0.01);
-            if (FLB_INPUT_CHUNK_FS_MAX_SIZE - content_size < min) {
+            min = (in->storage_max_chunk_size * 0.01);
+            if (content_size >= in->storage_max_chunk_size ||
+                in->storage_max_chunk_size - content_size < min) {
                 cio_chunk_down(ic->chunk);
             }
         }
