@@ -37,8 +37,9 @@ struct cio_chunk;
  */
 #define FLB_INPUT_CHUNK_SIZE           262144  /* 256KB (hint) */
 /*
- * Defines a maximum size for a Chunk in the file system: note that despite
- * this is considered a limit, a Chunk size might get greater than this.
+ * Defines the default maximum size for a Chunk in the file system: note that
+ * despite this is considered a limit, a Chunk size might get greater than
+ * this.
  */
 #define FLB_INPUT_CHUNK_FS_MAX_SIZE   2048000  /* 2MB */
 

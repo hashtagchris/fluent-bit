@@ -35,6 +35,7 @@ const char *input_chunk_property_keywords[] = {
     "tls.key_passwd",
     "threaded",
     "storage.type",
+    "storage.max_chunk_size",
 };
 
 int LLVMFuzzerTestOneInput(const uint8_t *data3, size_t size3)

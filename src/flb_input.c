@@ -180,6 +180,12 @@ struct flb_config_map input_global_properties[] = {
         "Sets the storage type for this input, one of: filesystem, memory or memrb."
     },
     {
+        FLB_CONFIG_MAP_SIZE, "storage.max_chunk_size", STR(FLB_INPUT_CHUNK_FS_MAX_SIZE),
+        0, FLB_FALSE, 0,
+        "Set the soft maximum size for input chunks. A chunk may exceed this value by the "
+        "size of the write that crosses the limit."
+    },
+    {
         FLB_CONFIG_MAP_BOOL, "storage.pause_on_chunks_overlimit", "false",
         0, FLB_FALSE, 0,
         "Enable pausing on an input when they reach their chunks limit"
@@ -660,6 +666,7 @@ struct flb_input_instance *flb_input_new(struct flb_config *config,
         instance->mem_buf_status = FLB_INPUT_RUNNING;
         instance->mem_buf_limit = 0;
         instance->mem_chunks_size = 0;
+        instance->storage_max_chunk_size = FLB_INPUT_CHUNK_FS_MAX_SIZE;
 #ifdef FLB_HAVE_METRICS
         instance->rate_window_size = FLB_NSEC_IN_SEC;
         instance->rate_gate_enabled = FLB_FALSE;
@@ -986,6 +993,15 @@ int flb_input_set_property(struct flb_input_instance *ins,
         }
         flb_sds_destroy(tmp);
 
+    }
+    else if (prop_key_check("storage.max_chunk_size", k, len) == 0 && tmp) {
+        limit = flb_utils_size_to_bytes(tmp);
+        flb_sds_destroy(tmp);
+        if (limit <= 0) {
+            flb_error("[input] storage.max_chunk_size must be greater than zero");
+            return -1;
+        }
+        ins->storage_max_chunk_size = (size_t) limit;
     }
     else if (prop_key_check("threaded", k, len) == 0 && tmp) {
         enabled = flb_utils_bool(tmp);

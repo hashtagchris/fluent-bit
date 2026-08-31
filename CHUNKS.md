@@ -21,6 +21,36 @@ For reliability and flexibility reasons, an input plugin might specify that all
 Chunks associated to it will be only located in memory, others might enable
 ```storage.type filesystem``` so the Chunk will be located also in filesystem.
 
+## Chunk size
+
+Input chunks have a soft maximum size of approximately 2 MB by default. Once a
+chunk crosses this threshold it is closed for further writes, but the write that
+crosses the threshold is not split and can make the final chunk larger.
+
+Advanced users can change the threshold for an individual input with
+`storage.max_chunk_size`. Larger chunks can reduce the number of output requests
+at the cost of higher memory use, flush latency, retry payload size, and coarser
+storage accounting. For example, a tail input feeding Azure Logs Ingestion can
+batch up to approximately 10 MB of uncompressed MessagePack data per chunk:
+
+```yaml
+pipeline:
+  inputs:
+    - name: tail
+      path: /var/log/containers/*.log
+      tag: azure.logs
+      storage.max_chunk_size: 10M
+
+  outputs:
+    - name: azure_logs_ingestion
+      match: azure.logs
+      compress: on
+      # Azure connection settings omitted.
+```
+
+The compressed HTTP payload size depends on the records being sent.
+`storage.max_chunk_size` does not enforce a compressed output size.
+
 ## Chunk I/O: Low level
 
 In the low level side, all the Chunks management magic happens on a thin library called
