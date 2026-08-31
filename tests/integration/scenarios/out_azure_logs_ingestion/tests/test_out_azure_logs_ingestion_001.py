@@ -15,20 +15,22 @@ logger = logging.getLogger(__name__)
 
 
 class Service:
-    def __init__(self, config_file):
+    def __init__(self, config_file, *, extra_env=None):
         self.config_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "../config", config_file))
         cert_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../in_splunk/certificate"))
         self.tls_crt_file = os.path.join(cert_dir, "certificate.pem")
         self.tls_key_file = os.path.join(cert_dir, "private_key.pem")
         self.oauth_server_port = None
+        service_env = {
+            "CERTIFICATE_TEST": self.tls_crt_file,
+            "PRIVATE_KEY_TEST": self.tls_key_file,
+        }
+        service_env.update(extra_env or {})
         self.service = FluentBitTestService(
             self.config_file,
             data_storage=data_storage,
             data_keys=["payloads", "requests"],
-            extra_env={
-                "CERTIFICATE_TEST": self.tls_crt_file,
-                "PRIVATE_KEY_TEST": self.tls_key_file,
-            },
+            extra_env=service_env,
             pre_start=self._start_receiver,
             post_stop=self._stop_receiver,
         )
@@ -154,3 +156,43 @@ def test_out_azure_logs_ingestion_legacy_oauth2_and_payload_format():
     assert payload[0]["source"] == "dummy"
     assert payload[0]["level"] == "info"
     assert isinstance(payload[0]["@timestamp"], (int, float))
+
+
+def test_out_azure_logs_ingestion_tail_uses_configured_chunk_size(tmp_path):
+    record_count = 768
+    record_length = 8192
+    tail_path = tmp_path / "azure-logs-ingestion.log"
+
+    with tail_path.open("w", encoding="utf-8") as stream:
+        for index in range(record_count):
+            prefix = f"record-{index:04d}-"
+            stream.write(prefix + ("x" * (record_length - len(prefix))) + "\n")
+
+    assert 2_048_000 < tail_path.stat().st_size < 10_000_000
+
+    service = Service(
+        "out_azure_logs_ingestion_tail_chunk_size.yaml",
+        extra_env={"AZURE_LOGS_INGESTION_TAIL_PATH": tail_path},
+    )
+    service.start()
+    configure_http_response(status_code=200, body={"status": "received"})
+    configure_oauth_token_response(
+        status_code=200,
+        body={"access_token": "oauth-access-token", "token_type": "Bearer", "expires_in": 300},
+    )
+
+    requests_seen = service.wait_for_requests(2, timeout=20)
+    service.stop()
+
+    data_requests = [
+        request
+        for request in requests_seen
+        if request["path"] == "/dataCollectionRules/dcr-suite/streams/Custom-suite_CL"
+    ]
+    assert len(data_requests) == 1
+
+    data_request = data_requests[0]
+    assert data_request["headers"].get("Content-Encoding") == "gzip"
+    assert len(data_request["json"]) == record_count
+    assert data_request["json"][0]["log"].startswith("record-0000-")
+    assert data_request["json"][-1]["log"].startswith(f"record-{record_count - 1:04d}-")
