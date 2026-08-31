@@ -308,6 +308,9 @@ struct flb_input_instance {
     /* Type of storage: CIO_STORE_FS (filesystem) or CIO_STORE_MEM (memory) */
     int storage_type;
 
+    /* Soft limit used to close chunks for further writes */
+    size_t storage_max_chunk_size;
+
     /*
      * Buffers counter: it counts the total of memory used by fixed and dynamic
      * message pack buffers used by the input plugin instance.
