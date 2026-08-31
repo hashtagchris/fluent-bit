@@ -17,7 +17,10 @@
  *  limitations under the License.
  */
 
+#include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <monkey/mk_core.h>
 #include <fluent-bit/flb_info.h>
@@ -38,14 +41,23 @@
 #include <fluent-bit/flb_upstream.h>
 #include <fluent-bit/flb_plugin.h>
 #include <fluent-bit/flb_kv.h>
+#include <fluent-bit/http_server/flb_http_server_config_map.h>
 #include <fluent-bit/flb_hash_table.h>
 #include <fluent-bit/flb_scheduler.h>
 #include <fluent-bit/flb_ring_buffer.h>
 #include <fluent-bit/flb_processor.h>
 #include <fluent-bit/flb_oauth2_jwt.h>
+#include <fluent-bit/flb_plugin_alias.h>
+#include <fluent-bit/flb_task.h>
 
 /* input plugin macro helpers */
 #include <fluent-bit/flb_input_plugin.h>
+
+#ifdef FLB_HAVE_METRICS
+#define FLB_INPUT_RATE_GATE_NSEC_PER_MSEC 1000000ULL
+
+static void flb_input_rate_gate_timer_cancel(struct flb_input_instance *ins);
+#endif
 
 #ifdef FLB_HAVE_CHUNK_TRACE
 #include <fluent-bit/flb_chunk_trace.h>
@@ -55,6 +67,52 @@ struct flb_libco_in_params libco_in_param;
 pthread_key_t libco_in_param_key;
 
 #define protcmp(a, b)  strncasecmp(a, b, strlen(a))
+
+static void flb_input_ingress_primitives_destroy(struct flb_input_instance *ins)
+{
+    if (ins == NULL) {
+        return;
+    }
+
+    pthread_mutex_destroy(&ins->ingress_queue_lock);
+    pthread_cond_destroy(&ins->ingress_queue_space_available);
+}
+
+static int flb_input_ingress_primitives_init(struct flb_input_instance *ins)
+{
+    int result;
+    pthread_condattr_t attr;
+
+    result = pthread_mutex_init(&ins->ingress_queue_lock, NULL);
+    if (result != 0) {
+        return -1;
+    }
+
+    result = pthread_condattr_init(&attr);
+    if (result != 0) {
+        pthread_mutex_destroy(&ins->ingress_queue_lock);
+        return -1;
+    }
+
+#if defined(CLOCK_MONOTONIC) && !defined(FLB_SYSTEM_WINDOWS) && !defined(FLB_SYSTEM_MACOS)
+    result = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (result != 0) {
+        pthread_condattr_destroy(&attr);
+        pthread_mutex_destroy(&ins->ingress_queue_lock);
+        return -1;
+    }
+#endif
+
+    result = pthread_cond_init(&ins->ingress_queue_space_available, &attr);
+    pthread_condattr_destroy(&attr);
+
+    if (result != 0) {
+        pthread_mutex_destroy(&ins->ingress_queue_lock);
+        return -1;
+    }
+
+    return 0;
+}
 
 /*
  * Ring buffer capacity: by default we make space for 1024 entries that each
@@ -72,6 +130,9 @@ pthread_key_t libco_in_param_key;
 #define FLB_INPUT_RING_BUFFER_CAPACITY 1024
 #define FLB_INPUT_RING_BUFFER_SIZE   (sizeof(void *) * FLB_INPUT_RING_BUFFER_CAPACITY)
 #define FLB_INPUT_RING_BUFFER_WINDOW (5)
+#ifdef FLB_HAVE_METRICS
+#define FLB_INPUT_RATE_WINDOW_DEFAULT "1s"
+#endif
 
 /* config map to register options available for all input plugins */
 struct flb_config_map input_global_properties[] = {
@@ -138,6 +199,39 @@ struct flb_config_map input_global_properties[] = {
         0, FLB_FALSE, 0,
         "Set custom ring buffer window percentage for threaded inputs"
     },
+#ifdef FLB_HAVE_METRICS
+    {
+        FLB_CONFIG_MAP_TIME, "rate_window", FLB_INPUT_RATE_WINDOW_DEFAULT,
+        0, FLB_FALSE, 0,
+        "Set input rate window using a time unit (for example: 1s, 1m, 1h). "
+        "The computed rate is always published in per-second units."
+    },
+    {
+        FLB_CONFIG_MAP_BOOL, "rate_gate", "false",
+        0, FLB_FALSE, 0,
+        "Enable input rate gate control."
+    },
+    {
+        FLB_CONFIG_MAP_SIZE, "rate_gate.max_bytes", "0",
+        0, FLB_FALSE, 0,
+        "Maximum input byte rate per second before pausing ingestion."
+    },
+    {
+        FLB_CONFIG_MAP_INT, "rate_gate.max_records", "0",
+        0, FLB_FALSE, 0,
+        "Maximum input record rate per second before pausing ingestion."
+    },
+    {
+        FLB_CONFIG_MAP_BOOL, "rate_gate.backpressure", "true",
+        0, FLB_FALSE, 0,
+        "Apply retry and busy chunk pressure when computing effective limits."
+    },
+    {
+        FLB_CONFIG_MAP_DOUBLE, "rate_gate.resume_ratio", "0.80",
+        0, FLB_FALSE, 0,
+        "Hysteresis threshold used for resuming input rate gate."
+    },
+#endif
 
     {0}
 };
@@ -150,13 +244,21 @@ struct mk_list *flb_input_get_global_config_map(struct flb_config *config)
 static int check_protocol(const char *prot, const char *output)
 {
     int len;
+    char *separator;
 
-    len = strlen(prot);
-    if (len != strlen(output)) {
+    separator = strstr(output, "://");
+    if (separator != NULL && separator != output) {
+        len = separator - output;
+    }
+    else {
+        len = strlen(output);
+    }
+
+    if (strlen(prot) != (size_t) len) {
         return 0;
     }
 
-    if (protcmp(prot, output) != 0) {
+    if (strncasecmp(prot, output, len) != 0) {
         return 0;
     }
 
@@ -228,8 +330,12 @@ struct flb_input_instance *flb_input_new(struct flb_config *config,
     int id;
     int ret;
     int flags = 0;
+    size_t input_name_length;
+    const char *alias_target;
+    const char *input_name;
+    const char *separator;
     struct mk_list *head;
-    struct flb_input_plugin *plugin;
+    struct flb_input_plugin *plugin = NULL;
     struct flb_input_instance *instance = NULL;
 
 /* use for locking the use of the chunk trace context. */
@@ -242,9 +348,36 @@ struct flb_input_instance *flb_input_new(struct flb_config *config,
         return NULL;
     }
 
+    input_name = input;
+
+    /* Prefer an exact registered plugin name over an alias with the same name. */
     mk_list_foreach(head, &config->in_plugins) {
         plugin = mk_list_entry(head, struct flb_input_plugin, _head);
-        if (!check_protocol(plugin->name, input)) {
+        if (check_protocol(plugin->name, input_name)) {
+            break;
+        }
+        plugin = NULL;
+    }
+
+    if (plugin == NULL) {
+        separator = strstr(input, "://");
+        if (separator != NULL && separator != input) {
+            input_name_length = separator - input;
+        }
+        else {
+            input_name_length = strlen(input);
+        }
+        alias_target = flb_plugin_alias_get(FLB_PLUGIN_INPUT, input,
+                                            input_name_length);
+        if (alias_target == NULL) {
+            return NULL;
+        }
+        input_name = alias_target;
+    }
+
+    mk_list_foreach(head, &config->in_plugins) {
+        plugin = mk_list_entry(head, struct flb_input_plugin, _head);
+        if (!check_protocol(plugin->name, input_name)) {
             plugin = NULL;
             continue;
         }
@@ -263,6 +396,15 @@ struct flb_input_instance *flb_input_new(struct flb_config *config,
             flb_errno();
             return NULL;
         }
+
+        instance->http_server_config = flb_calloc(1, sizeof(struct flb_http_server_config));
+        if (!instance->http_server_config) {
+            flb_errno();
+            flb_free(instance);
+            return NULL;
+        }
+
+        flb_http_server_config_init(instance->http_server_config);
         instance->config = config;
 
         /* Get an ID */
@@ -272,6 +414,7 @@ struct flb_input_instance *flb_input_new(struct flb_config *config,
         instance->ht_log_chunks = flb_hash_table_create(FLB_HASH_TABLE_EVICT_NONE,
                                                         512, 0);
         if (!instance->ht_log_chunks) {
+            flb_free(instance->http_server_config);
             flb_free(instance);
             return NULL;
         }
@@ -281,6 +424,7 @@ struct flb_input_instance *flb_input_new(struct flb_config *config,
                                                            512, 0);
         if (!instance->ht_metric_chunks) {
             flb_hash_table_destroy(instance->ht_log_chunks);
+            flb_free(instance->http_server_config);
             flb_free(instance);
             return NULL;
         }
@@ -291,6 +435,7 @@ struct flb_input_instance *flb_input_new(struct flb_config *config,
         if (!instance->ht_trace_chunks) {
             flb_hash_table_destroy(instance->ht_log_chunks);
             flb_hash_table_destroy(instance->ht_metric_chunks);
+            flb_free(instance->http_server_config);
             flb_free(instance);
             return NULL;
         }
@@ -302,9 +447,12 @@ struct flb_input_instance *flb_input_new(struct flb_config *config,
             flb_hash_table_destroy(instance->ht_log_chunks);
             flb_hash_table_destroy(instance->ht_metric_chunks);
             flb_hash_table_destroy(instance->ht_trace_chunks);
+            flb_free(instance->http_server_config);
             flb_free(instance);
             return NULL;
         }
+
+        pthread_mutex_init(&instance->metrics_chunk_lock, NULL);
 
         /* format name (with instance id) */
         snprintf(instance->name, sizeof(instance->name) - 1,
@@ -319,6 +467,12 @@ struct flb_input_instance *flb_input_new(struct flb_config *config,
             ctx = flb_calloc(1, sizeof(struct flb_plugin_input_proxy_context));
             if (!ctx) {
                 flb_errno();
+                pthread_mutex_destroy(&instance->metrics_chunk_lock);
+                flb_hash_table_destroy(instance->ht_log_chunks);
+                flb_hash_table_destroy(instance->ht_metric_chunks);
+                flb_hash_table_destroy(instance->ht_trace_chunks);
+                flb_hash_table_destroy(instance->ht_profile_chunks);
+                flb_free(instance->http_server_config);
                 flb_free(instance);
                 return NULL;
             }
@@ -337,6 +491,7 @@ struct flb_input_instance *flb_input_new(struct flb_config *config,
         instance->tag      = NULL;
         instance->tag_len  = 0;
         instance->tag_default = FLB_FALSE;
+        instance->telemetry_metrics_logs_tag_records = -1;
         instance->routable = FLB_TRUE;
         instance->data     = data;
         instance->storage  = NULL;
@@ -366,12 +521,67 @@ struct flb_input_instance *flb_input_new(struct flb_config *config,
         /* Initialize properties list */
         flb_kv_init(&instance->properties);
         flb_kv_init(&instance->net_properties);
+       flb_kv_init(&instance->http_server_properties);
         flb_kv_init(&instance->oauth2_jwt_properties);
+        mk_list_init(&instance->ingress_queue);
+        ret = flb_input_ingress_primitives_init(instance);
+        if (ret != 0) {
+            pthread_mutex_destroy(&instance->metrics_chunk_lock);
+            if (instance->ht_log_chunks) {
+                flb_hash_table_destroy(instance->ht_log_chunks);
+            }
+            if (instance->ht_metric_chunks) {
+                flb_hash_table_destroy(instance->ht_metric_chunks);
+            }
+            if (instance->ht_trace_chunks) {
+                flb_hash_table_destroy(instance->ht_trace_chunks);
+            }
+            if (instance->ht_profile_chunks) {
+                flb_hash_table_destroy(instance->ht_profile_chunks);
+            }
+            if (plugin->type != FLB_INPUT_PLUGIN_CORE && instance->context) {
+                flb_free(instance->context);
+            }
+            flb_free(instance->http_server_config);
+            flb_free(instance);
+            return NULL;
+        }
+        instance->ingress_queue_channels[0] = -1;
+        instance->ingress_queue_channels[1] = -1;
+        instance->ingress_queue_enabled = FLB_FALSE;
+        instance->ingress_queue_collector_id = -1;
+        instance->ingress_queue_signal_pending = FLB_FALSE;
+        instance->ingress_queue_pending_events = 0;
+        instance->ingress_queue_pending_bytes = 0;
+        instance->ingress_queue_event_limit = FLB_HTTP_SERVER_INGRESS_QUEUE_EVENT_LIMIT;
+        instance->ingress_queue_byte_limit = FLB_HTTP_SERVER_INGRESS_QUEUE_BYTE_LIMIT;
 
         /* Plugin use networking */
         if (plugin->flags & (FLB_INPUT_NET | FLB_INPUT_NET_SERVER)) {
-            ret = flb_net_host_set(plugin->name, &instance->host, input);
+            if (strstr(input, "://") != NULL) {
+                ret = flb_net_host_set(plugin->name, &instance->host, input);
+            }
+            else {
+                ret = flb_net_host_set(plugin->name, &instance->host, input_name);
+            }
             if (ret != 0) {
+                if (instance->ht_log_chunks) {
+                    flb_hash_table_destroy(instance->ht_log_chunks);
+                }
+                if (instance->ht_metric_chunks) {
+                    flb_hash_table_destroy(instance->ht_metric_chunks);
+                }
+                if (instance->ht_trace_chunks) {
+                    flb_hash_table_destroy(instance->ht_trace_chunks);
+                }
+                if (instance->ht_profile_chunks) {
+                    flb_hash_table_destroy(instance->ht_profile_chunks);
+                }
+                if (plugin->type != FLB_INPUT_PLUGIN_CORE && instance->context) {
+                    flb_free(instance->context);
+                }
+                flb_input_ingress_primitives_destroy(instance);
+                flb_free(instance->http_server_config);
                 flb_free(instance);
                 return NULL;
             }
@@ -400,6 +610,7 @@ struct flb_input_instance *flb_input_new(struct flb_config *config,
         instance->tls                   = NULL;
         instance->tls_debug             = -1;
         instance->tls_verify            = FLB_TRUE;
+        instance->tls_verify_client     = FLB_FALSE;
         instance->tls_verify_hostname   = FLB_FALSE;
         instance->tls_vhost             = NULL;
         instance->tls_ca_path           = NULL;
@@ -429,6 +640,19 @@ struct flb_input_instance *flb_input_new(struct flb_config *config,
         if (!instance->rb) {
             flb_error("instance %s could not initialize ring buffer",
                       flb_input_name(instance));
+            flb_hash_table_destroy(instance->ht_log_chunks);
+            flb_hash_table_destroy(instance->ht_metric_chunks);
+            flb_hash_table_destroy(instance->ht_trace_chunks);
+            flb_hash_table_destroy(instance->ht_profile_chunks);
+            if (plugin->type != FLB_INPUT_PLUGIN_CORE) {
+                flb_free(instance->context);
+            }
+            flb_sds_destroy(instance->host.name);
+            flb_sds_destroy(instance->host.address);
+            flb_uri_destroy(instance->host.uri);
+            flb_sds_destroy(instance->host.listen);
+            flb_input_ingress_primitives_destroy(instance);
+            flb_free(instance->http_server_config);
             flb_free(instance);
             return NULL;
         }
@@ -436,6 +660,18 @@ struct flb_input_instance *flb_input_new(struct flb_config *config,
         instance->mem_buf_status = FLB_INPUT_RUNNING;
         instance->mem_buf_limit = 0;
         instance->mem_chunks_size = 0;
+#ifdef FLB_HAVE_METRICS
+        instance->rate_window_size = FLB_NSEC_IN_SEC;
+        instance->rate_gate_enabled = FLB_FALSE;
+        instance->rate_gate_status = FLB_INPUT_RUNNING;
+        instance->rate_gate_use_backpressure = FLB_TRUE;
+        instance->rate_gate_resume_ratio = 0.80;
+        instance->rate_gate_max_bytes = 0;
+        instance->rate_gate_max_records = 0;
+        instance->rate_gate_busy_chunks = 0;
+        instance->rate_gate_retry_attempts = 0;
+        instance->rate_gate_timer = NULL;
+#endif
         instance->storage_buf_status = FLB_INPUT_RUNNING;
         mk_list_add(&instance->_head, &config->inputs);
 
@@ -561,12 +797,21 @@ int flb_input_set_property(struct flb_input_instance *ins,
 {
     int len;
     int ret;
+#ifdef FLB_HAVE_METRICS
+    int seconds;
+#endif
     int enabled;
     ssize_t limit;
     flb_sds_t tmp = NULL;
+#ifdef FLB_HAVE_METRICS
+    char *end;
+    double parsed_ratio;
+    unsigned long long parsed;
+#endif
     struct flb_kv *kv;
 
     len = strlen(k);
+    /* Resolve environment variables in the provided value */
     tmp = flb_env_var_translate(ins->config->env, v);
     if (tmp) {
         if (flb_sds_len(tmp) == 0) {
@@ -648,6 +893,16 @@ int flb_input_set_property(struct flb_input_instance *ins,
         }
         kv->val = tmp;
     }
+    else if ((ins->p->flags & FLB_INPUT_HTTP_SERVER) != 0 &&
+             flb_http_server_property_is_allowed(k) == FLB_TRUE &&
+             tmp != NULL) {
+        kv = flb_kv_item_create(&ins->http_server_properties, (char *) k, NULL);
+        if (!kv) {
+            flb_sds_destroy(tmp);
+            return -1;
+        }
+        kv->val = tmp;
+    }
 
 #ifdef FLB_HAVE_TLS
     else if (prop_key_check("tls", k, len) == 0 && tmp) {
@@ -662,6 +917,14 @@ int flb_input_set_property(struct flb_input_instance *ins,
     else if (prop_key_check("tls.verify", k, len) == 0 && tmp) {
         ins->tls_verify = flb_utils_bool(tmp);
         flb_sds_destroy(tmp);
+    }
+    else if (prop_key_check("tls.verify_client_cert", k, len) == 0 && tmp) {
+        ret = flb_utils_bool(tmp);
+        flb_sds_destroy(tmp);
+        if (ret == -1) {
+            return -1;
+        }
+        ins->tls_verify_client = ret;
     }
     else if (prop_key_check("tls.verify_hostname", k, len) == 0 && tmp) {
         ins->tls_verify_hostname = flb_utils_bool(tmp);
@@ -759,6 +1022,70 @@ int flb_input_set_property(struct flb_input_instance *ins,
         }
         ins->ring_buffer_window = (uint8_t) ret;
     }
+#ifdef FLB_HAVE_METRICS
+    else if (prop_key_check("rate_window", k, len) == 0 && tmp) {
+        seconds = flb_utils_time_to_seconds(tmp);
+        flb_sds_destroy(tmp);
+        if (seconds <= 0) {
+            flb_error("[input] invalid rate_window value");
+            return -1;
+        }
+        ins->rate_window_size = ((uint64_t) seconds) * FLB_NSEC_IN_SEC;
+    }
+    else if (prop_key_check("rate_gate", k, len) == 0 && tmp) {
+        ret = flb_utils_bool(tmp);
+        flb_sds_destroy(tmp);
+        if (ret == -1) {
+            return -1;
+        }
+        ins->rate_gate_enabled = ret;
+    }
+    else if (prop_key_check("rate_gate.max_bytes", k, len) == 0 && tmp) {
+        limit = flb_utils_size_to_bytes(tmp);
+        flb_sds_destroy(tmp);
+        if (limit < 0) {
+            return -1;
+        }
+        ins->rate_gate_max_bytes = (size_t) limit;
+    }
+    else if (prop_key_check("rate_gate.max_records", k, len) == 0 && tmp) {
+        end = NULL;
+        errno = 0;
+        parsed = strtoull(tmp, &end, 10);
+
+        if (end == tmp || *end != '\0' || strchr(tmp, '-') != NULL || errno == ERANGE ||
+            parsed > SIZE_MAX) {
+            flb_sds_destroy(tmp);
+            return -1;
+        }
+
+        flb_sds_destroy(tmp);
+        ins->rate_gate_max_records = (size_t) parsed;
+    }
+    else if (prop_key_check("rate_gate.backpressure", k, len) == 0 && tmp) {
+        ret = flb_utils_bool(tmp);
+        flb_sds_destroy(tmp);
+        if (ret == -1) {
+            return -1;
+        }
+        ins->rate_gate_use_backpressure = ret;
+    }
+    else if (prop_key_check("rate_gate.resume_ratio", k, len) == 0 && tmp) {
+        end = NULL;
+        errno = 0;
+        parsed_ratio = strtod(tmp, &end);
+
+        if (end == tmp || *end != '\0' || errno == ERANGE ||
+            !(parsed_ratio > 0.0 && parsed_ratio < 1.0)) {
+            flb_error("[input] rate_gate.resume_ratio must be between 0 and 1");
+            flb_sds_destroy(tmp);
+            return -1;
+        }
+
+        flb_sds_destroy(tmp);
+        ins->rate_gate_resume_ratio = parsed_ratio;
+    }
+#endif
     else if (prop_key_check("storage.pause_on_chunks_overlimit", k, len) == 0 && tmp) {
         ret = flb_utils_bool(tmp);
         flb_sds_destroy(tmp);
@@ -772,6 +1099,16 @@ int flb_input_set_property(struct flb_input_instance *ins,
          * Create the property, we don't pass the value since we will
          * map it directly to avoid an extra memory allocation.
          */
+        if (flb_config_map_property_has_dynamic_env(ins->p->config_map, k) == FLB_TRUE) {
+            if (tmp) {
+                flb_sds_destroy(tmp);
+            }
+            tmp = flb_sds_create(v);
+            if (!tmp) {
+                return -1;
+            }
+        }
+
         kv = flb_kv_item_create(&ins->properties, (char *) k, NULL);
         if (!kv) {
             if (tmp) {
@@ -813,6 +1150,12 @@ void flb_input_instance_destroy(struct flb_input_instance *ins)
     struct mk_list *tmp;
     struct mk_list *head;
     struct flb_input_collector *collector;
+
+    flb_input_ingress_destroy(ins);
+
+#ifdef FLB_HAVE_METRICS
+    flb_input_rate_gate_timer_cancel(ins);
+#endif
 
     if (ins->alias) {
         flb_sds_destroy(ins->alias);
@@ -890,6 +1233,7 @@ void flb_input_instance_destroy(struct flb_input_instance *ins)
     /* release properties */
     flb_kv_release(&ins->properties);
     flb_kv_release(&ins->net_properties);
+    flb_kv_release(&ins->http_server_properties);
     flb_kv_release(&ins->oauth2_jwt_properties);
 
 
@@ -921,6 +1265,14 @@ void flb_input_instance_destroy(struct flb_input_instance *ins)
         flb_config_map_destroy(ins->net_config_map);
     }
 
+    if (ins->http_server_config_map) {
+        flb_config_map_destroy(ins->http_server_config_map);
+    }
+
+    if (ins->http_server_config) {
+        flb_free(ins->http_server_config);
+    }
+
     if (ins->oauth2_jwt_config_map) {
         flb_config_map_destroy(ins->oauth2_jwt_config_map);
     }
@@ -946,6 +1298,8 @@ void flb_input_instance_destroy(struct flb_input_instance *ins)
         ins->ht_profile_chunks = NULL;
     }
 
+    pthread_mutex_destroy(&ins->metrics_chunk_lock);
+
     if (ins->ch_events[0] > 0) {
         mk_event_closesocket(ins->ch_events[0]);
     }
@@ -954,12 +1308,23 @@ void flb_input_instance_destroy(struct flb_input_instance *ins)
         mk_event_closesocket(ins->ch_events[1]);
     }
 
+    if (ins->ingress_queue_channels[0] > 0) {
+        mk_event_closesocket(ins->ingress_queue_channels[0]);
+    }
+
+    if (ins->ingress_queue_channels[1] > 0) {
+        mk_event_closesocket(ins->ingress_queue_channels[1]);
+    }
+
     /* Collectors */
     mk_list_foreach_safe(head, tmp, &ins->collectors) {
         collector = mk_list_entry(head, struct flb_input_collector, _head);
         mk_list_del(&collector->_head);
         flb_input_collector_destroy(collector);
     }
+
+    pthread_mutex_destroy(&ins->ingress_queue_lock);
+    pthread_cond_destroy(&ins->ingress_queue_space_available);
 
     /* delete storage context */
     flb_storage_input_destroy(ins);
@@ -1073,8 +1438,32 @@ int flb_input_plugin_property_check(struct flb_input_instance *ins,
                                     struct flb_config *config)
 {
     int ret = 0;
+    struct mk_list *tmp;
+    struct mk_list *head;
     struct mk_list *config_map;
+    struct flb_kv *kv;
+    struct flb_kv *moved;
     struct flb_input_plugin *p = ins->p;
+
+    if ((p->flags & FLB_INPUT_HTTP_SERVER) != 0) {
+        mk_list_foreach_safe(head, tmp, &ins->properties) {
+            kv = mk_list_entry(head, struct flb_kv, _head);
+
+            if (flb_http_server_property_is_allowed(kv->key) == FLB_FALSE) {
+                continue;
+            }
+
+            moved = flb_kv_item_create(&ins->http_server_properties, kv->key, NULL);
+            if (moved == NULL) {
+                return -1;
+            }
+
+            moved->val = kv->val;
+            kv->val = NULL;
+            mk_list_del(&kv->_head);
+            flb_kv_item_destroy(kv);
+        }
+    }
 
     if (p->config_map) {
         /*
@@ -1106,7 +1495,7 @@ int flb_input_plugin_property_check(struct flb_input_instance *ins,
 }
 
 int flb_input_oauth2_jwt_property_check(struct flb_input_instance *ins,
-                                         struct flb_config *config)
+                                        struct flb_config *config)
 {
     int ret = 0;
 
@@ -1125,6 +1514,35 @@ int flb_input_oauth2_jwt_property_check(struct flb_input_instance *ins,
         ret = flb_config_map_properties_check(ins->p->name,
                                               &ins->oauth2_jwt_properties,
                                               ins->oauth2_jwt_config_map);
+        if (ret == -1) {
+            if (config->program_name) {
+                flb_helper("try the command: %s -i %s -h\n",
+                           config->program_name, ins->p->name);
+            }
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int flb_input_http_server_property_check(struct flb_input_instance *ins,
+                                                struct flb_config *config)
+{
+    int ret = 0;
+
+    if (ins->http_server_config_map == NULL) {
+        ins->http_server_config_map = flb_http_server_get_config_map(config);
+        if (!ins->http_server_config_map) {
+            flb_input_instance_destroy(ins);
+            return -1;
+        }
+    }
+
+    if (mk_list_size(&ins->http_server_properties) > 0) {
+        ret = flb_config_map_properties_check(ins->p->name,
+                                              &ins->http_server_properties,
+                                              ins->http_server_config_map);
         if (ret == -1) {
             if (config->program_name) {
                 flb_helper("try the command: %s -i %s -h\n",
@@ -1158,9 +1576,16 @@ int flb_input_instance_init(struct flb_input_instance *ins,
 #ifdef FLB_HAVE_METRICS
     uint64_t ts;
     char *name;
+    int logs_tag_records_enabled;
 
     name = (char *) flb_input_name(ins);
     ts = cfl_time_now();
+
+    /* resolve effective tag-records tracking: input override wins over service */
+    logs_tag_records_enabled =
+        (ins->telemetry_metrics_logs_tag_records != -1)
+        ? ins->telemetry_metrics_logs_tag_records
+        : ctx->telemetry_metrics_logs_tag_records;
 
     /* CMetrics */
     ins->cmt = cmt_create();
@@ -1190,6 +1615,65 @@ int flb_input_instance_init(struct flb_input_instance *ins,
                            "Number of input records.",
                            1, (char *[]) {"name"});
     cmt_counter_set(ins->cmt_records, ts, 0, 1, (char *[]) {name});
+
+    /* fluentbit_input_rate_bytes */
+    ins->cmt_rate_bytes = \
+        cmt_gauge_create(ins->cmt,
+                         "fluentbit", "input", "rate_bytes",
+                         "Current input bytes per second.",
+                         1, (char *[]) {"name"});
+    cmt_gauge_set(ins->cmt_rate_bytes, ts, 0, 1, (char *[]) {name});
+
+    /* fluentbit_input_rate_records */
+    ins->cmt_rate_records = \
+        cmt_gauge_create(ins->cmt,
+                         "fluentbit", "input", "rate_records",
+                         "Current input records per second.",
+                         1, (char *[]) {"name"});
+    cmt_gauge_set(ins->cmt_rate_records, ts, 0, 1, (char *[]) {name});
+
+    /* fluentbit_input_rate_gate_limited */
+    ins->cmt_rate_gate_limited = \
+        cmt_gauge_create(ins->cmt,
+                         "fluentbit", "input", "rate_gate_limited",
+                         "Is the input rate gate currently limiting ingestion?",
+                         1, (char *[]) {"name"});
+    cmt_gauge_set(ins->cmt_rate_gate_limited, ts, 0, 1, (char *[]) {name});
+
+    ins->cmt_rate_gate_busy_chunks = \
+        cmt_gauge_create(ins->cmt,
+                         "fluentbit", "input", "rate_gate_busy_chunks",
+                         "Busy chunks considered by the input rate gate.",
+                         1, (char *[]) {"name"});
+    cmt_gauge_set(ins->cmt_rate_gate_busy_chunks, ts, 0, 1, (char *[]) {name});
+
+    ins->cmt_rate_gate_retry_attempts = \
+        cmt_gauge_create(ins->cmt,
+                         "fluentbit", "input", "rate_gate_retry_attempts",
+                         "Retry attempts considered by the input rate gate.",
+                         1, (char *[]) {"name"});
+    cmt_gauge_set(ins->cmt_rate_gate_retry_attempts, ts, 0, 1, (char *[]) {name});
+    if (logs_tag_records_enabled == FLB_TRUE) {
+        /* fluentbit_input_logs_tag_records_total */
+        ins->cmt_logs_tag_records = \
+            cmt_counter_create(ins->cmt,
+                               "fluentbit", "input", "logs_tag_records_total",
+                               "Number of input log records by tag.",
+                               2, (char *[]) {"name", "tag"});
+        if (!ins->cmt_logs_tag_records) {
+            return -1;
+        }
+
+        /* fluentbit_input_logs_tag_records_untracked_total */
+        ins->cmt_logs_tag_records_untracked = \
+            cmt_counter_create(ins->cmt,
+                               "fluentbit", "input", "logs_tag_records_untracked_total",
+                               "Number of input log records not tracked by tag.",
+                               2, (char *[]) {"name", "reason"});
+        if (!ins->cmt_logs_tag_records_untracked) {
+            return -1;
+        }
+    }
 
     /* fluentbit_input_ingestion_paused */
     ins->cmt_ingestion_paused = \
@@ -1314,6 +1798,35 @@ int flb_input_instance_init(struct flb_input_instance *ins,
                             1, (char *[]) {"name"});
     cmt_counter_set(ins->cmt_ring_buffer_retry_failures, ts, 0, 1, (char *[]) {name});
 
+    if ((p->flags & FLB_INPUT_HTTP_SERVER) != 0) {
+        /* fluentbit_input_http_server_ingress_queue_busy_total */
+        ins->cmt_ingress_queue_busy = \
+            cmt_counter_create(ins->cmt,
+                               "fluentbit", "input",
+                               "http_server_ingress_queue_busy_total",
+                               "Number of deferred HTTP server ingress queue busy events.",
+                               1, (char *[]) {"name"});
+        cmt_counter_set(ins->cmt_ingress_queue_busy, ts, 0, 1, (char *[]) {name});
+
+        /* fluentbit_input_http_server_ingress_queue_pending_events */
+        ins->cmt_ingress_queue_pending_events = \
+            cmt_gauge_create(ins->cmt,
+                             "fluentbit", "input",
+                             "http_server_ingress_queue_pending_events",
+                             "Current number of deferred HTTP server ingress queue events.",
+                             1, (char *[]) {"name"});
+        cmt_gauge_set(ins->cmt_ingress_queue_pending_events, ts, 0, 1, (char *[]) {name});
+
+        /* fluentbit_input_http_server_ingress_queue_pending_bytes */
+        ins->cmt_ingress_queue_pending_bytes = \
+            cmt_gauge_create(ins->cmt,
+                             "fluentbit", "input",
+                             "http_server_ingress_queue_pending_bytes",
+                             "Current number of deferred HTTP server ingress queue bytes.",
+                             1, (char *[]) {"name"});
+        cmt_gauge_set(ins->cmt_ingress_queue_pending_bytes, ts, 0, 1, (char *[]) {name});
+    }
+
     /* OLD Metrics */
     ins->metrics = flb_metrics_create(name);
     if (ins->metrics) {
@@ -1336,6 +1849,13 @@ int flb_input_instance_init(struct flb_input_instance *ins,
      */
     if (mk_list_size(&ins->oauth2_jwt_properties) > 0) {
         if (flb_input_oauth2_jwt_property_check(ins, config) == -1) {
+            return -1;
+        }
+    }
+
+    if ((p->flags & FLB_INPUT_HTTP_SERVER) != 0 ||
+        mk_list_size(&ins->http_server_properties) > 0) {
+        if (flb_input_http_server_property_check(ins, config) == -1) {
             return -1;
         }
     }
@@ -1385,6 +1905,16 @@ int flb_input_instance_init(struct flb_input_instance *ins,
             ret = flb_tls_set_verify_hostname(ins->tls, ins->tls_verify_hostname);
             if (ret == -1) {
                 flb_error("[input %s] error set up to verify hostname in TLS context",
+                          ins->name);
+
+                return -1;
+            }
+        }
+
+        if (ins->tls_verify_client == FLB_TRUE) {
+            ret = flb_tls_set_verify_client(ins->tls, ins->tls_verify_client);
+            if (ret == -1) {
+                flb_error("[input %s] error set up to verify client certificate in TLS context",
                           ins->name);
 
                 return -1;
@@ -1594,7 +2124,6 @@ void flb_input_instance_exit(struct flb_input_instance *ins,
     }
 }
 
-/* Invoke all exit input callbacks */
 void flb_input_exit_all(struct flb_config *config)
 {
     struct mk_list *tmp;
@@ -1602,7 +2131,6 @@ void flb_input_exit_all(struct flb_config *config)
     struct flb_input_instance *ins;
     struct flb_input_plugin *p;
 
-    /* Iterate instances */
     mk_list_foreach_safe_r(head, tmp, &config->inputs) {
         ins = mk_list_entry(head, struct flb_input_instance, _head);
         p = ins->p;
@@ -1610,10 +2138,7 @@ void flb_input_exit_all(struct flb_config *config)
             continue;
         }
 
-        /* invoke plugin instance exit callback */
         flb_input_instance_exit(ins, config);
-
-        /* destroy the instance */
         flb_input_instance_destroy(ins);
     }
 }
@@ -1708,25 +2233,11 @@ static struct flb_input_collector *collector_create(int type,
         coll->evl = thi->evl;
     }
     else {
-        struct mk_event_loop *tls_evl;
-
-        /*
-         * Collectors for non-threaded plugins normally run on the main
-         * engine event loop. When a private helper input such as the
-         * emitter is instantiated from within a threaded input (e.g. via
-         * an input processor), the input thread stores its own event loop
-         * in TLS.  Those helper inputs must continue to use the main
-         * engine event loop to avoid spinning the input thread.
+        /* Non-threaded inputs must always attach collectors to the owner
+         * engine loop. Using a transient TLS event loop here can orphan
+         * FD-driven collectors created during plugin initialization.
          */
-        tls_evl = flb_engine_evl_get();
-
-        if (tls_evl != NULL && tls_evl != config->evl &&
-            !(ins->p && (ins->p->flags & FLB_INPUT_PRIVATE))) {
-            coll->evl = tls_evl;
-        }
-        else {
-            coll->evl = config->evl;
-        }
+        coll->evl = config->evl;
     }
 
     /*
@@ -1866,6 +2377,499 @@ int flb_input_collector_start(int coll_id, struct flb_input_instance *in)
 
     return -1;
 }
+
+#ifdef FLB_HAVE_METRICS
+static void flb_input_rate_gate_effective_limit(struct flb_input_instance *ins,
+                                                double max_limit,
+                                                int for_resume,
+                                                double *effective_limit)
+{
+    size_t pressure;
+    double limit;
+
+    limit = max_limit;
+    pressure = 0;
+    if (ins->rate_gate_use_backpressure == FLB_TRUE) {
+        if (ins->rate_gate_busy_chunks > SIZE_MAX - ins->rate_gate_retry_attempts) {
+            pressure = SIZE_MAX;
+        }
+        else {
+            pressure = ins->rate_gate_busy_chunks + ins->rate_gate_retry_attempts;
+        }
+    }
+
+    if (pressure > 0 && limit > 0.0) {
+        limit = limit / ((double) pressure + 1.0);
+    }
+
+    if (for_resume == FLB_TRUE) {
+        limit *= ins->rate_gate_resume_ratio;
+    }
+
+    *effective_limit = limit;
+}
+
+static int flb_input_rate_gate_is_limited(struct flb_input_instance *ins)
+{
+    double current_window_bytes_rate;
+    double current_window_records_rate;
+    double effective_max_bytes;
+    double effective_max_records;
+    double window_seconds;
+    uint64_t window_size;
+
+    if (ins == NULL || ins->rate_gate_enabled != FLB_TRUE) {
+        return FLB_FALSE;
+    }
+
+    /* * 1. Record-based limit check
+     */
+    flb_input_rate_gate_effective_limit(ins,
+                                        (double) ins->rate_gate_max_records,
+                                        FLB_FALSE,
+                                        &effective_max_records);
+
+    if (ins->rate_gate_max_records > 0) {
+        window_size = ins->rate_window_size;
+        if (window_size == 0) {
+            window_seconds = 1.0;
+        }
+        else {
+            window_seconds = (double) window_size / (double) FLB_NSEC_IN_SEC;
+            if (window_seconds <= 0.0) {
+                window_seconds = 1.0;
+            }
+        }
+        current_window_records_rate = (double) ins->rate_window_records /
+                                      window_seconds;
+
+        /* Check the accumulated count in the active fixed window. */
+        if (current_window_records_rate > effective_max_records) {
+            return FLB_TRUE;
+        }
+    }
+
+    /* * 2. Byte-based limit check
+     */
+    flb_input_rate_gate_effective_limit(ins,
+                                        (double) ins->rate_gate_max_bytes,
+                                        FLB_FALSE,
+                                        &effective_max_bytes);
+
+    if (ins->rate_gate_max_bytes > 0) {
+        window_size = ins->rate_window_size;
+        if (window_size == 0) {
+            window_seconds = 1.0;
+        }
+        else {
+            window_seconds = (double) window_size / (double) FLB_NSEC_IN_SEC;
+            if (window_seconds <= 0.0) {
+                window_seconds = 1.0;
+            }
+        }
+        current_window_bytes_rate = (double) ins->rate_window_bytes /
+                                    window_seconds;
+
+        /* Check the accumulated bytes in the active fixed window. */
+        if (current_window_bytes_rate > effective_max_bytes) {
+            return FLB_TRUE;
+        }
+    }
+
+    return FLB_FALSE;
+}
+
+static int flb_input_rate_gate_can_resume(struct flb_input_instance *ins)
+{
+    double current_window_bytes_rate;
+    double current_window_records_rate;
+    double resume_max_bytes;
+    double resume_max_records;
+    double window_seconds;
+    uint64_t window_size;
+
+    if (ins == NULL || ins->rate_gate_enabled != FLB_TRUE) {
+        return FLB_FALSE;
+    }
+
+    flb_input_rate_gate_effective_limit(ins,
+                                        (double) ins->rate_gate_max_records,
+                                        FLB_TRUE,
+                                        &resume_max_records);
+    if (ins->rate_gate_max_records > 0) {
+        window_size = ins->rate_window_size;
+        if (window_size == 0) {
+            window_seconds = 1.0;
+        }
+        else {
+            window_seconds = (double) window_size / (double) FLB_NSEC_IN_SEC;
+            if (window_seconds <= 0.0) {
+                window_seconds = 1.0;
+            }
+        }
+        current_window_records_rate = (double) ins->rate_window_records /
+                                      window_seconds;
+
+        if (current_window_records_rate > resume_max_records) {
+            return FLB_FALSE;
+        }
+    }
+
+    flb_input_rate_gate_effective_limit(ins,
+                                        (double) ins->rate_gate_max_bytes,
+                                        FLB_TRUE,
+                                        &resume_max_bytes);
+    if (ins->rate_gate_max_bytes > 0) {
+        window_size = ins->rate_window_size;
+        if (window_size == 0) {
+            window_seconds = 1.0;
+        }
+        else {
+            window_seconds = (double) window_size / (double) FLB_NSEC_IN_SEC;
+            if (window_seconds <= 0.0) {
+                window_seconds = 1.0;
+            }
+        }
+        current_window_bytes_rate = (double) ins->rate_window_bytes /
+                                    window_seconds;
+
+        if (current_window_bytes_rate > resume_max_bytes) {
+            return FLB_FALSE;
+        }
+    }
+
+    return FLB_TRUE;
+}
+
+static void flb_input_rate_gate_collect_backpressure(struct flb_input_instance *ins)
+{
+    struct mk_list *head;
+    struct mk_list *retry_head;
+    struct flb_input_chunk *ic;
+    struct flb_task *task;
+    struct flb_task_retry *retry;
+
+    if (ins == NULL) {
+        return;
+    }
+
+    ins->rate_gate_busy_chunks = 0;
+    ins->rate_gate_retry_attempts = 0;
+
+    if (ins->rate_gate_use_backpressure != FLB_TRUE) {
+        return;
+    }
+
+    mk_list_foreach(head, &ins->chunks) {
+        ic = mk_list_entry(head, struct flb_input_chunk, _head);
+        if (ic->busy == FLB_TRUE) {
+            if (ins->rate_gate_busy_chunks < SIZE_MAX) {
+                ins->rate_gate_busy_chunks++;
+            }
+        }
+    }
+
+    mk_list_foreach(head, &ins->tasks) {
+        task = mk_list_entry(head, struct flb_task, _head);
+        mk_list_foreach(retry_head, &task->retries) {
+            retry = mk_list_entry(retry_head, struct flb_task_retry, _head);
+            if (retry->attempts > 0 &&
+                (size_t) retry->attempts > SIZE_MAX - ins->rate_gate_retry_attempts) {
+                ins->rate_gate_retry_attempts = SIZE_MAX;
+            }
+            else if (retry->attempts > 0) {
+                ins->rate_gate_retry_attempts += (size_t) retry->attempts;
+            }
+        }
+    }
+}
+
+static void flb_input_rate_gate_timer_cancel(struct flb_input_instance *ins)
+{
+    struct flb_sched_timer *timer;
+
+    if (ins == NULL || ins->rate_gate_timer == NULL) {
+        return;
+    }
+
+    timer = ins->rate_gate_timer;
+    ins->rate_gate_timer = NULL;
+    flb_sched_timer_cb_destroy(timer);
+}
+
+static void flb_input_rate_gate_timer_callback(struct flb_config *config, void *data)
+{
+    struct flb_input_instance *ins;
+
+    (void) config;
+
+    ins = data;
+    ins->rate_gate_timer = NULL;
+    flb_input_rate_gate_maybe_resume(ins);
+}
+
+static int flb_input_rate_gate_timer_schedule(struct flb_input_instance *ins,
+                                              uint64_t timestamp)
+{
+    int delay;
+    int ret;
+    uint64_t deadline;
+    uint64_t delay_milliseconds;
+    uint64_t remaining;
+    uint64_t window_size;
+
+    if (ins == NULL) {
+        return -1;
+    }
+
+    if (ins->rate_gate_timer != NULL) {
+        return 0;
+    }
+
+    if (ins->config == NULL || ins->config->sched == NULL) {
+        return -1;
+    }
+
+    window_size = ins->rate_window_size;
+    if (window_size == 0) {
+        window_size = FLB_NSEC_IN_SEC;
+    }
+
+    if (window_size > UINT64_MAX - ins->rate_window_start) {
+        deadline = UINT64_MAX;
+    }
+    else {
+        deadline = ins->rate_window_start + window_size;
+    }
+
+    if (deadline > timestamp) {
+        remaining = deadline - timestamp;
+    }
+    else {
+        remaining = 0;
+    }
+
+    delay_milliseconds = remaining / FLB_INPUT_RATE_GATE_NSEC_PER_MSEC;
+    if (remaining % FLB_INPUT_RATE_GATE_NSEC_PER_MSEC != 0) {
+        delay_milliseconds++;
+    }
+
+    if (delay_milliseconds == 0) {
+        delay = 1;
+    }
+    else if (delay_milliseconds > INT_MAX) {
+        delay = INT_MAX;
+    }
+    else {
+        delay = (int) delay_milliseconds;
+    }
+
+    ret = flb_sched_timer_cb_create(ins->config->sched,
+                                    FLB_SCHED_TIMER_CB_ONESHOT,
+                                    delay,
+                                    flb_input_rate_gate_timer_callback,
+                                    ins,
+                                    &ins->rate_gate_timer);
+    if (ret == -1) {
+        ins->rate_gate_timer = NULL;
+        return -1;
+    }
+
+    return 0;
+}
+
+static void flb_input_rate_gate_resume(struct flb_input_instance *ins)
+{
+    flb_input_rate_gate_timer_cancel(ins);
+    ins->rate_gate_status = FLB_INPUT_RUNNING;
+
+    if (ins->mem_buf_status == FLB_INPUT_RUNNING &&
+        ins->storage_buf_status == FLB_INPUT_RUNNING &&
+        ins->config->is_running == FLB_TRUE &&
+        ins->config->is_ingestion_active == FLB_TRUE) {
+        flb_input_resume(ins);
+        flb_info("[input] %s resume (rate gate)", flb_input_name(ins));
+    }
+}
+
+int flb_input_rate_gate_protect(struct flb_input_instance *ins)
+{
+    int ret;
+    uint64_t ts;
+    char *name;
+
+    if (ins == NULL || ins->rate_gate_enabled != FLB_TRUE) {
+        return FLB_FALSE;
+    }
+
+    ts = cfl_time_now();
+    flb_input_rate_update(ins, ts, 0, 0);
+    flb_input_rate_gate_collect_backpressure(ins);
+
+    if (flb_input_rate_gate_is_limited(ins) == FLB_FALSE) {
+        return FLB_FALSE;
+    }
+
+    if (ins->rate_gate_status != FLB_INPUT_PAUSED) {
+        ret = flb_input_rate_gate_timer_schedule(ins, ts);
+        if (ret == -1) {
+            flb_error("[input] %s could not schedule rate gate recovery; "
+                      "continuing ingestion", flb_input_name(ins));
+            return FLB_FALSE;
+        }
+
+        flb_warn("[input] %s paused (rate gate limit exceeded)",
+                 flb_input_name(ins));
+        flb_input_pause(ins);
+        ins->rate_gate_status = FLB_INPUT_PAUSED;
+    }
+
+    name = (char *) flb_input_name(ins);
+    if (ins->cmt_rate_gate_limited != NULL) {
+        cmt_gauge_set(ins->cmt_rate_gate_limited, ts, 1, 1, (char *[]) {name});
+    }
+    if (ins->cmt_rate_gate_busy_chunks != NULL) {
+        cmt_gauge_set(ins->cmt_rate_gate_busy_chunks, ts,
+                      (double) ins->rate_gate_busy_chunks, 1, (char *[]) {name});
+    }
+    if (ins->cmt_rate_gate_retry_attempts != NULL) {
+        cmt_gauge_set(ins->cmt_rate_gate_retry_attempts, ts,
+                      (double) ins->rate_gate_retry_attempts, 1, (char *[]) {name});
+    }
+
+    return FLB_TRUE;
+}
+
+void flb_input_rate_gate_maybe_resume(struct flb_input_instance *ins)
+{
+    int can_resume;
+    uint64_t ts;
+    char *name;
+
+    if (ins == NULL || ins->rate_gate_enabled != FLB_TRUE) {
+        return;
+    }
+
+    if (ins->rate_gate_status != FLB_INPUT_PAUSED) {
+        return;
+    }
+
+    ts = cfl_time_now();
+    flb_input_rate_update(ins, ts, 0, 0);
+    flb_input_rate_gate_collect_backpressure(ins);
+    can_resume = flb_input_rate_gate_can_resume(ins);
+
+    if (can_resume == FLB_TRUE) {
+        flb_input_rate_gate_resume(ins);
+    }
+    else if (ins->rate_gate_timer == NULL) {
+        if (flb_input_rate_gate_timer_schedule(ins, ts) == -1) {
+            flb_error("[input] %s could not reschedule rate gate recovery; "
+                      "continuing ingestion", flb_input_name(ins));
+            flb_input_rate_gate_resume(ins);
+        }
+    }
+
+    name = (char *) flb_input_name(ins);
+    if (ins->cmt_rate_gate_limited != NULL &&
+        ins->rate_gate_status == FLB_INPUT_RUNNING) {
+        cmt_gauge_set(ins->cmt_rate_gate_limited, ts, 0, 1, (char *[]) {name});
+    }
+    else if (ins->cmt_rate_gate_limited != NULL) {
+        cmt_gauge_set(ins->cmt_rate_gate_limited, ts, 1, 1, (char *[]) {name});
+    }
+    if (ins->cmt_rate_gate_busy_chunks != NULL) {
+        cmt_gauge_set(ins->cmt_rate_gate_busy_chunks, ts,
+                      (double) ins->rate_gate_busy_chunks, 1, (char *[]) {name});
+    }
+    if (ins->cmt_rate_gate_retry_attempts != NULL) {
+        cmt_gauge_set(ins->cmt_rate_gate_retry_attempts, ts,
+                      (double) ins->rate_gate_retry_attempts, 1, (char *[]) {name});
+    }
+}
+
+void flb_input_rate_update(struct flb_input_instance *ins,
+                           uint64_t timestamp,
+                           size_t records,
+                           size_t bytes)
+{
+    double window_seconds;
+    char *name;
+    uint64_t elapsed;
+    uint64_t elapsed_windows;
+    uint64_t rate_window_size;
+
+    if (ins == NULL) {
+        return;
+    }
+
+    if (timestamp == 0) {
+        timestamp = cfl_time_now();
+    }
+
+    if (ins->rate_window_start == 0) {
+        ins->rate_window_start = timestamp;
+    }
+
+    rate_window_size = ins->rate_window_size;
+    if (rate_window_size == 0) {
+        rate_window_size = FLB_NSEC_IN_SEC;
+    }
+
+    if (timestamp < ins->rate_window_start) {
+        ins->rate_window_start = timestamp;
+        ins->rate_window_records = 0;
+        ins->rate_window_bytes = 0;
+        ins->rate_records = 0.0;
+        ins->rate_bytes = 0.0;
+    }
+
+    elapsed = timestamp - ins->rate_window_start;
+    if (elapsed >= rate_window_size) {
+        elapsed_windows = elapsed / rate_window_size;
+        window_seconds = (double) rate_window_size / (double) FLB_NSEC_IN_SEC;
+
+        /* If a complete idle window elapsed, the most recent rate is zero. */
+        if (elapsed_windows > 1) {
+            ins->rate_records = 0.0;
+            ins->rate_bytes = 0.0;
+        }
+        else {
+            ins->rate_records = (double) ins->rate_window_records / window_seconds;
+            ins->rate_bytes = (double) ins->rate_window_bytes / window_seconds;
+        }
+
+        name = (char *) flb_input_name(ins);
+        if (ins->cmt_rate_records != NULL) {
+            cmt_gauge_set(ins->cmt_rate_records, timestamp, ins->rate_records,
+                          1, (char *[]) {name});
+        }
+
+        if (ins->cmt_rate_bytes != NULL) {
+            cmt_gauge_set(ins->cmt_rate_bytes, timestamp, ins->rate_bytes,
+                          1, (char *[]) {name});
+        }
+
+        ins->rate_window_start += elapsed_windows * rate_window_size;
+        ins->rate_window_records = 0;
+        ins->rate_window_bytes = 0;
+    }
+
+    if (records > SIZE_MAX - ins->rate_window_records) {
+        ins->rate_window_records = SIZE_MAX;
+    }
+    else {
+        ins->rate_window_records += records;
+    }
+
+    if (bytes > SIZE_MAX - ins->rate_window_bytes) {
+        ins->rate_window_bytes = SIZE_MAX;
+    }
+    else {
+        ins->rate_window_bytes += bytes;
+    }
+}
+#endif
 
 /* start collectors for main thread, no threaded plugins */
 int flb_input_collectors_signal_start(struct flb_input_instance *ins)
@@ -2009,6 +3013,46 @@ static void flb_input_ingestion_resumed(struct flb_input_instance *ins)
     }
 }
 
+int flb_input_plugin_pause(struct flb_input_instance *ins)
+{
+    int ret;
+
+    ret = 0;
+
+    if (ins->p->cb_pause_checked != NULL) {
+        ret = ins->p->cb_pause_checked(ins->context, ins->config);
+    }
+    else if (ins->p->cb_pause != NULL) {
+        ins->p->cb_pause(ins->context, ins->config);
+    }
+
+    if (ret == 0) {
+        flb_input_ingestion_paused(ins);
+    }
+
+    return ret;
+}
+
+int flb_input_plugin_resume(struct flb_input_instance *ins)
+{
+    int ret;
+
+    ret = 0;
+
+    if (ins->p->cb_resume_checked != NULL) {
+        ret = ins->p->cb_resume_checked(ins->context, ins->config);
+    }
+    else if (ins->p->cb_resume != NULL) {
+        ins->p->cb_resume(ins->context, ins->config);
+    }
+
+    if (ret == 0) {
+        flb_input_ingestion_resumed(ins);
+    }
+
+    return ret;
+}
+
 int flb_input_pause(struct flb_input_instance *ins)
 {
     /* if the instance is already paused, just return */
@@ -2017,14 +3061,14 @@ int flb_input_pause(struct flb_input_instance *ins)
     }
 
     /* Pause only if a callback is set and a local context exists */
-    if (ins->p->cb_pause && ins->context) {
+    if ((ins->p->cb_pause || ins->p->cb_pause_checked) && ins->context) {
         if (flb_input_is_threaded(ins)) {
             /* signal the thread event loop about the 'pause' operation */
-            flb_input_thread_instance_pause(ins);
+            return flb_input_thread_instance_pause(ins);
         }
         else {
             flb_info("[input] pausing %s", flb_input_name(ins));
-            ins->p->cb_pause(ins->context, ins->config);
+            return flb_input_plugin_pause(ins);
         }
     }
 
@@ -2035,14 +3079,14 @@ int flb_input_pause(struct flb_input_instance *ins)
 
 int flb_input_resume(struct flb_input_instance *ins)
 {
-    if (ins->p->cb_resume) {
+    if ((ins->p->cb_resume || ins->p->cb_resume_checked) && ins->context) {
         if (flb_input_is_threaded(ins)) {
             /* signal the thread event loop about the 'resume' operation */
-            flb_input_thread_instance_resume(ins);
+            return flb_input_thread_instance_resume(ins);
         }
         else {
             flb_info("[input] resume %s", flb_input_name(ins));
-            ins->p->cb_resume(ins->context, ins->config);
+            return flb_input_plugin_resume(ins);
         }
     }
 

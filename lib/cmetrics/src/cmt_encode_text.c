@@ -389,32 +389,37 @@ static void append_summary_metric_value(cfl_sds_t *buf,
 static void append_exp_histogram_metric_value(cfl_sds_t *buf,
                                               struct cmt_metric *metric)
 {
+    struct cmt_exp_histogram_snapshot snapshot;
     size_t entry_buffer_length;
     char entry_buffer[256];
     size_t index;
+
+    if (cmt_metric_exp_hist_get_snapshot(metric, &snapshot) != 0) {
+        return;
+    }
 
     cfl_sds_cat_safe(buf, " = { ", 5);
 
     entry_buffer_length = snprintf(entry_buffer,
                                    sizeof(entry_buffer) - 1,
                                    "scale=%d, zero_count=%" PRIu64 ", zero_threshold=%.17g, ",
-                                   metric->exp_hist_scale,
-                                   metric->exp_hist_zero_count,
-                                   metric->exp_hist_zero_threshold);
+                                   snapshot.scale,
+                                   snapshot.zero_count,
+                                   snapshot.zero_threshold);
     cfl_sds_cat_safe(buf, entry_buffer, entry_buffer_length);
 
     entry_buffer_length = snprintf(entry_buffer,
                                    sizeof(entry_buffer) - 1,
                                    "positive={offset=%d, bucket_counts=[",
-                                   metric->exp_hist_positive_offset);
+                                   snapshot.positive_offset);
     cfl_sds_cat_safe(buf, entry_buffer, entry_buffer_length);
 
-    for (index = 0; index < metric->exp_hist_positive_count; index++) {
+    for (index = 0; index < snapshot.positive_count; index++) {
         entry_buffer_length = snprintf(entry_buffer,
                                        sizeof(entry_buffer) - 1,
                                        "%" PRIu64 "%s",
-                                       metric->exp_hist_positive_buckets[index],
-                                       (index + 1 < metric->exp_hist_positive_count) ? ", " : "");
+                                       snapshot.positive_buckets[index],
+                                       (index + 1 < snapshot.positive_count) ? ", " : "");
         cfl_sds_cat_safe(buf, entry_buffer, entry_buffer_length);
     }
 
@@ -423,15 +428,15 @@ static void append_exp_histogram_metric_value(cfl_sds_t *buf,
     entry_buffer_length = snprintf(entry_buffer,
                                    sizeof(entry_buffer) - 1,
                                    "negative={offset=%d, bucket_counts=[",
-                                   metric->exp_hist_negative_offset);
+                                   snapshot.negative_offset);
     cfl_sds_cat_safe(buf, entry_buffer, entry_buffer_length);
 
-    for (index = 0; index < metric->exp_hist_negative_count; index++) {
+    for (index = 0; index < snapshot.negative_count; index++) {
         entry_buffer_length = snprintf(entry_buffer,
                                        sizeof(entry_buffer) - 1,
                                        "%" PRIu64 "%s",
-                                       metric->exp_hist_negative_buckets[index],
-                                       (index + 1 < metric->exp_hist_negative_count) ? ", " : "");
+                                       snapshot.negative_buckets[index],
+                                       (index + 1 < snapshot.negative_count) ? ", " : "");
         cfl_sds_cat_safe(buf, entry_buffer, entry_buffer_length);
     }
 
@@ -440,14 +445,14 @@ static void append_exp_histogram_metric_value(cfl_sds_t *buf,
     entry_buffer_length = snprintf(entry_buffer,
                                    sizeof(entry_buffer) - 1,
                                    "count=%" PRIu64,
-                                   metric->exp_hist_count);
+                                   snapshot.count);
     cfl_sds_cat_safe(buf, entry_buffer, entry_buffer_length);
 
-    if (metric->exp_hist_sum_set) {
+    if (snapshot.sum_set) {
         entry_buffer_length = snprintf(entry_buffer,
                                        sizeof(entry_buffer) - 1,
                                        ", sum=%.17g",
-                                       cmt_math_uint64_to_d64(metric->exp_hist_sum));
+                                       cmt_math_uint64_to_d64(snapshot.sum));
     }
     else {
         entry_buffer_length = snprintf(entry_buffer,
@@ -457,6 +462,7 @@ static void append_exp_histogram_metric_value(cfl_sds_t *buf,
     cfl_sds_cat_safe(buf, entry_buffer, entry_buffer_length);
 
     cfl_sds_cat_safe(buf, " }\n", 3);
+    cmt_metric_exp_hist_snapshot_destroy(&snapshot);
 }
 
 static void append_metric_value(cfl_sds_t *buf, struct cmt_map *map,
@@ -491,6 +497,8 @@ static void format_metric(struct cmt *cmt, cfl_sds_t *buf, struct cmt_map *map,
     int len;
     int count = 0;
     int static_labels = 0;
+    int label_key_count;
+    int label_index;
     char tmp[128];
     uint64_t ts;
     struct tm tm;
@@ -536,7 +544,28 @@ static void format_metric(struct cmt *cmt, cfl_sds_t *buf, struct cmt_map *map,
         }
     }
 
-    n = cfl_list_size(&metric->labels);
+    n = 0;
+    label_key_count = map->label_count;
+    label_index = 0;
+    if (label_key_count > 0) {
+        label_k = cfl_list_entry_first(&map->label_keys, struct cmt_map_label, _head);
+    }
+    cfl_list_foreach(head, &metric->labels) {
+        if (label_index >= label_key_count) {
+            break;
+        }
+
+        label_v = cfl_list_entry(head, struct cmt_map_label, _head);
+
+        if (label_k->name != NULL && label_v->name != NULL) {
+            n++;
+        }
+
+        label_index++;
+        label_k = cfl_list_entry_next(&label_k->_head, struct cmt_map_label,
+                                      _head, &map->label_keys);
+    }
+
     if (n > 0) {
         if (static_labels > 0) {
             cfl_sds_cat_safe(buf, ",", 1);
@@ -545,11 +574,23 @@ static void format_metric(struct cmt *cmt, cfl_sds_t *buf, struct cmt_map *map,
             cfl_sds_cat_safe(buf, "{", 1);
         }
 
+        label_index = 0;
         label_k = cfl_list_entry_first(&map->label_keys, struct cmt_map_label, _head);
 
         i = 1;
         cfl_list_foreach(head, &metric->labels) {
+            if (label_index >= label_key_count) {
+                break;
+            }
+
             label_v = cfl_list_entry(head, struct cmt_map_label, _head);
+
+            if (label_k->name == NULL || label_v->name == NULL) {
+                label_index++;
+                label_k = cfl_list_entry_next(&label_k->_head, struct cmt_map_label,
+                                              _head, &map->label_keys);
+                continue;
+            }
 
             cfl_sds_cat_safe(buf, label_k->name, cfl_sds_len(label_k->name));
             cfl_sds_cat_safe(buf, "=\"", 2);
@@ -563,8 +604,9 @@ static void format_metric(struct cmt *cmt, cfl_sds_t *buf, struct cmt_map *map,
             }
             i++;
 
+            label_index++;
             label_k = cfl_list_entry_next(&label_k->_head, struct cmt_map_label,
-                                         _head, &map->label_keys);
+                                          _head, &map->label_keys);
         }
         cfl_sds_cat_safe(buf, "}", 1);
 

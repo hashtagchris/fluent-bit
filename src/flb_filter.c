@@ -27,6 +27,8 @@
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_metrics.h>
 #include <fluent-bit/flb_utils.h>
+#include <fluent-bit/flb_plugin.h>
+#include <fluent-bit/flb_plugin_alias.h>
 #include <chunkio/chunkio.h>
 
 #ifdef FLB_HAVE_CHUNK_TRACE
@@ -267,7 +269,7 @@ void flb_filter_do(struct flb_input_chunk *ic,
                     break;
                 }
                 else {
-                    out_records = flb_mp_count(out_buf, out_size);
+                    out_records = flb_mp_count_log_records(out_buf, out_size);
 
 #ifdef FLB_HAVE_METRICS
                     if (out_records > in_records) {
@@ -374,6 +376,14 @@ int flb_filter_set_property(struct flb_filter_instance *ins,
          * Create the property, we don't pass the value since we will
          * map it directly to avoid an extra memory allocation.
          */
+        if (flb_config_map_property_has_dynamic_env(ins->p->config_map, k) == FLB_TRUE) {
+            flb_sds_destroy(tmp);
+            tmp = flb_sds_create(v);
+            if (!tmp) {
+                return -1;
+            }
+        }
+
         kv = flb_kv_item_create(&ins->properties, (char *) k, NULL);
         if (!kv) {
             if (tmp) {
@@ -427,6 +437,8 @@ struct flb_filter_instance *flb_filter_new(struct flb_config *config,
                                            const char *filter, void *data)
 {
     int id;
+    const char *alias_target;
+    const char *effective_filter_name;
     struct mk_list *head;
     struct flb_filter_plugin *plugin;
     struct flb_filter_instance *instance = NULL;
@@ -435,12 +447,30 @@ struct flb_filter_instance *flb_filter_new(struct flb_config *config,
         return NULL;
     }
 
+    effective_filter_name = filter;
+
     mk_list_foreach(head, &config->filter_plugins) {
         plugin = mk_list_entry(head, struct flb_filter_plugin, _head);
-        if (strcasecmp(plugin->name, filter) == 0) {
+        if (strcasecmp(plugin->name, effective_filter_name) == 0) {
             break;
         }
         plugin = NULL;
+    }
+
+    if (plugin == NULL) {
+        alias_target = flb_plugin_alias_get(FLB_PLUGIN_FILTER, filter,
+                                            strlen(filter));
+        if (alias_target != NULL) {
+            effective_filter_name = alias_target;
+
+            mk_list_foreach(head, &config->filter_plugins) {
+                plugin = mk_list_entry(head, struct flb_filter_plugin, _head);
+                if (strcasecmp(plugin->name, effective_filter_name) == 0) {
+                    break;
+                }
+                plugin = NULL;
+            }
+        }
     }
 
     if (!plugin) {
@@ -485,7 +515,6 @@ struct flb_filter_instance *flb_filter_new(struct flb_config *config,
 
     mk_list_init(&instance->properties);
     mk_list_add(&instance->_head, &config->filters);
-
     return instance;
 }
 

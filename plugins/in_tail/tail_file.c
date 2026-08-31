@@ -21,6 +21,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <time.h>
+#ifndef FLB_SYSTEM_WINDOWS
+#include <unistd.h>
+#endif
 #ifdef FLB_SYSTEM_FREEBSD
 #include <sys/user.h>
 #include <libutil.h>
@@ -54,9 +57,211 @@
 
 #include <cfl/cfl.h>
 
+#define FLB_TAIL_DB_OFFSET_MARKER_SIZE 32
+
+#ifdef FLB_SYSTEM_WINDOWS
+static inline int tail_file_open(struct flb_tail_config *ctx, const char *path,
+                                 int flags)
+{
+    if (ctx->windows_path_encoding == FLB_TAIL_WINDOWS_PATH_ENCODING_UTF8) {
+        return win32_open_utf8(path, flags);
+    }
+
+    return open(path, flags);
+}
+
+static inline int tail_file_stat(struct flb_tail_config *ctx, const char *path,
+                                 struct stat *st)
+{
+    if (ctx->windows_path_encoding == FLB_TAIL_WINDOWS_PATH_ENCODING_UTF8) {
+        return win32_stat_utf8(path, st);
+    }
+
+    return stat(path, st);
+}
+
+static inline int tail_file_lstat(struct flb_tail_config *ctx, const char *path,
+                                  struct stat *st)
+{
+    if (ctx->windows_path_encoding == FLB_TAIL_WINDOWS_PATH_ENCODING_UTF8) {
+        return win32_lstat_utf8(path, st);
+    }
+
+    return lstat(path, st);
+}
+#else
+static inline int tail_file_open(struct flb_tail_config *ctx, const char *path,
+                                 int flags)
+{
+    (void) ctx;
+
+    return open(path, flags);
+}
+
+static inline int tail_file_stat(struct flb_tail_config *ctx, const char *path,
+                                 struct stat *st)
+{
+    (void) ctx;
+
+    return stat(path, st);
+}
+
+static inline int tail_file_lstat(struct flb_tail_config *ctx, const char *path,
+                                  struct stat *st)
+{
+    (void) ctx;
+
+    return lstat(path, st);
+}
+#endif
+
 static inline void consume_bytes(char *buf, int bytes, int length)
 {
     memmove(buf, buf + bytes, length - bytes);
+}
+
+static int compute_offset_marker(struct flb_tail_file *file,
+                                 int64_t offset,
+                                 uint64_t *marker,
+                                 size_t *marker_size)
+{
+    off_t current;
+    off_t start;
+    ssize_t bytes;
+    size_t window;
+    char buf[FLB_TAIL_DB_OFFSET_MARKER_SIZE];
+
+    *marker = 0;
+    *marker_size = 0;
+
+    if (offset <= 0) {
+        return 0;
+    }
+
+    current = lseek(file->fd, 0, SEEK_CUR);
+    if (current == -1) {
+        flb_errno();
+        return -1;
+    }
+
+    window = offset;
+    if (window > sizeof(buf)) {
+        window = sizeof(buf);
+    }
+
+    start = offset - window;
+    if (lseek(file->fd, start, SEEK_SET) == -1) {
+        flb_errno();
+        return -1;
+    }
+
+    bytes = read(file->fd, buf, window);
+    if (bytes == -1) {
+        flb_errno();
+        lseek(file->fd, current, SEEK_SET);
+        return -1;
+    }
+
+    if (lseek(file->fd, current, SEEK_SET) == -1) {
+        flb_errno();
+        return -1;
+    }
+
+    if (bytes != window) {
+        return -1;
+    }
+
+    *marker = cfl_hash_64bits(buf, window);
+    *marker_size = window;
+    return 0;
+}
+
+int flb_tail_file_update_offset_marker(struct flb_tail_file *file)
+{
+    int ret;
+    uint64_t marker;
+    size_t marker_size;
+    off_t db_offset;
+
+    db_offset = flb_tail_file_db_offset(file);
+
+    ret = compute_offset_marker(file, db_offset, &marker, &marker_size);
+    if (ret != 0) {
+        file->db_offset_marker = 0;
+        file->db_offset_marker_size = 0;
+        return -1;
+    }
+
+    file->db_offset_marker = marker;
+    file->db_offset_marker_size = marker_size;
+    return 0;
+}
+
+int flb_tail_file_offset_marker_matches(struct flb_tail_file *file)
+{
+    int ret;
+    uint64_t marker;
+    size_t marker_size;
+    off_t db_offset;
+
+    db_offset = flb_tail_file_db_offset(file);
+
+    if (db_offset <= 0 || file->db_offset_marker_size == 0) {
+        return FLB_TRUE;
+    }
+
+    ret = compute_offset_marker(file, db_offset, &marker, &marker_size);
+    if (ret != 0) {
+        return FLB_FALSE;
+    }
+
+    if (marker_size != file->db_offset_marker_size) {
+        return FLB_FALSE;
+    }
+
+    if (marker != file->db_offset_marker) {
+        return FLB_FALSE;
+    }
+
+    return FLB_TRUE;
+}
+
+static void update_resumable_offset_state(struct flb_tail_file *file)
+{
+#ifdef FLB_HAVE_SQLDB
+    if (file->config->db) {
+        flb_tail_db_file_offset(file, file->config);
+        return;
+    }
+#endif
+
+    flb_tail_file_update_offset_marker(file);
+}
+
+int flb_tail_file_reset_on_truncate(struct flb_tail_file *file,
+                                    int64_t size_delta,
+                                    const char *caller)
+{
+    int64_t offset;
+    struct flb_tail_config *ctx = file->config;
+
+    offset = lseek(file->fd, 0, SEEK_SET);
+    if (offset == -1) {
+        flb_errno();
+        return -1;
+    }
+
+    flb_plg_debug(ctx->ins,
+                  "%s: inode=%"PRIu64" file truncated %s (diff: %"PRId64" bytes)",
+                  caller, file->inode, file->name, size_delta);
+
+    file->offset = offset;
+    file->stream_offset = offset;
+    file->last_processed_bytes = 0;
+    file->buf_len = 0;
+
+    update_resumable_offset_state(file);
+    return 0;
 }
 
 static uint64_t stat_get_st_dev(struct stat *st)
@@ -314,9 +519,12 @@ int flb_tail_pack_line_map(struct flb_time *time, char **data,
         if (result == FLB_EVENT_ENCODER_SUCCESS) {
             result = flb_log_event_encoder_append_body_values(
                         file->sl_log_event_encoder,
-                        FLB_LOG_EVENT_CSTRING_VALUE(file->config->offset_key),
-                        FLB_LOG_EVENT_UINT64_VALUE(file->stream_offset +
-                                                   processed_bytes));
+                        FLB_LOG_EVENT_CSTRING_VALUE(file->config->offset_key));
+        }
+        if (result == FLB_EVENT_ENCODER_SUCCESS) {
+            result = flb_log_event_encoder_append_body_uint64(
+                        file->sl_log_event_encoder,
+                        (uint64_t)(file->stream_offset + processed_bytes));
         }
     }
 
@@ -364,9 +572,12 @@ int flb_tail_file_pack_line(struct flb_time *time, char *data, size_t data_size,
         if (result == FLB_EVENT_ENCODER_SUCCESS) {
             result = flb_log_event_encoder_append_body_values(
                         file->sl_log_event_encoder,
-                        FLB_LOG_EVENT_CSTRING_VALUE(file->config->offset_key),
-                        FLB_LOG_EVENT_UINT64_VALUE(file->stream_offset +
-                                                   processed_bytes));
+                        FLB_LOG_EVENT_CSTRING_VALUE(file->config->offset_key));
+        }
+        if (result == FLB_EVENT_ENCODER_SUCCESS) {
+            result = flb_log_event_encoder_append_body_uint64(
+                        file->sl_log_event_encoder,
+                        (uint64_t)(file->stream_offset + processed_bytes));
         }
     }
 
@@ -1031,7 +1242,8 @@ static inline int flb_tail_file_exists(struct stat *st,
  * file in question.
  */
 static int set_file_position(struct flb_tail_config *ctx,
-                             struct flb_tail_file *file)
+                             struct flb_tail_file *file,
+                             int explicit_offset)
 {
     int64_t ret;
 
@@ -1043,11 +1255,27 @@ static int set_file_position(struct flb_tail_config *ctx,
     if (ctx->db) {
         ret = flb_tail_db_file_set(file, ctx);
         if (ret == 0) {
+            if (file->offset > file->size ||
+                flb_tail_file_offset_marker_matches(file) != FLB_TRUE) {
+                /*
+                 * A persisted offset can become invalid after a stop + copytruncate
+                 * sequence or after inode reuse. Reset to the beginning of the
+                 * current inode instead of seeking into the middle of replacement
+                 * content.
+                 */
+                file->offset = 0;
+                file->stream_offset = 0;
+                flb_tail_db_file_offset(file, ctx);
+            }
+
             if (file->offset > 0) {
                 ret = lseek(file->fd, file->offset, SEEK_SET);
                 if (ret == -1) {
                     flb_errno();
                     return -1;
+                }
+                if (file->decompression_context == NULL) {
+                    file->stream_offset = ret;
                 }
             }
             else if (ctx->read_from_head == FLB_FALSE) {
@@ -1057,6 +1285,9 @@ static int set_file_position(struct flb_tail_config *ctx,
                     return -1;
                 }
                 file->offset = ret;
+                if (file->decompression_context == NULL) {
+                    file->stream_offset = ret;
+                }
                 flb_tail_db_file_offset(file, ctx);
             }
             return 0;
@@ -1064,29 +1295,37 @@ static int set_file_position(struct flb_tail_config *ctx,
     }
 #endif
 
-    if (ctx->read_from_head == FLB_TRUE) {
-        /* no need to seek, offset position is already zero */
-        return 0;
-    }
-
-    if (file->offset > 0) {
+    /* A pre-set offset (e.g. from an aged-out re-pickup) must be honoured
+     * even when read_from_head is true; the flag only governs truly new
+     * files that have no prior read position. */
+    if (explicit_offset) {
         ret = lseek(file->fd, file->offset, SEEK_SET);
 
         if (ret == -1) {
             flb_errno();
             return -1;
         }
-    }
-    else {
-        ret = lseek(file->fd, 0, SEEK_END);
 
-        if (ret == -1) {
-            flb_errno();
-            return -1;
+        if (file->decompression_context == NULL) {
+            file->stream_offset = ret;
         }
 
-        file->offset = ret;
+        return 0;
     }
+
+    if (ctx->read_from_head == FLB_TRUE) {
+        /* no need to seek, offset position is already zero */
+        return 0;
+    }
+
+    ret = lseek(file->fd, 0, SEEK_END);
+
+    if (ret == -1) {
+        flb_errno();
+        return -1;
+    }
+
+    file->offset = ret;
 
     if (file->decompression_context == NULL) {
         file->stream_offset = ret;
@@ -1138,7 +1377,17 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
                          ssize_t offset,
                          struct flb_tail_config *ctx)
 {
-    int fd;
+    /*
+     * Cleanup uses staged-goto labels in reverse acquisition order;
+     * jumping to err_X cleans up everything acquired up to and including X
+     * and falls through to subsequent labels. Each label undoes exactly one
+     * acquisition step. Construction-failure paths must NOT route through
+     * flb_tail_file_remove() because that helper increments the
+     * cmt_files_closed counter unconditionally and would unbalance the
+     * cmt_files_opened/closed pair (the matching opened increment lives at
+     * the very end of this function, immediately before return 0).
+     */
+    int fd = -1;
     int ret;
     uint64_t stream_id;
     uint64_t ts;
@@ -1166,7 +1415,7 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
     }
     #endif
 
-    fd = open(path, O_RDONLY);
+    fd = tail_file_open(ctx, path, O_RDONLY);
     if (fd == -1) {
         flb_errno();
         flb_plg_error(ctx->ins, "cannot open %s", path);
@@ -1176,15 +1425,17 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
     file = flb_calloc(1, sizeof(struct flb_tail_file));
     if (!file) {
         flb_errno();
-        goto error;
+        goto err_close_fd;
     }
 
     /* Initialize */
-    file->watch_fd  = -1;
+    file->config    = ctx;
     file->fd        = fd;
+    file->watch_fd  = -1;
+    file->tail_mode = mode;
 
     /* On non-windows environments check if the original path is a link */
-    ret = lstat(path, &lst);
+    ret = tail_file_lstat(ctx, path, &lst);
     if (ret == 0) {
         if (S_ISLNK(lst.st_mode)) {
             file->is_link = FLB_TRUE;
@@ -1196,7 +1447,7 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
     ret = stat_to_hash_bits(ctx, st, &hash_bits);
     if (ret != 0) {
         flb_plg_error(ctx->ins, "error procesisng hash bits for file %s", path);
-        goto error;
+        goto err_free_file;
     }
     file->hash_bits = hash_bits;
 
@@ -1204,7 +1455,7 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
     ret = stat_to_hash_key(ctx, st, &hash_key);
     if (ret != 0) {
         flb_plg_error(ctx->ins, "error procesisng hash key for file %s", path);
-        goto error;
+        goto err_free_file;
     }
     file->hash_key = hash_key;
 
@@ -1213,8 +1464,6 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
     file->size      = st->st_size;
     file->buf_len   = 0;
     file->parsed    = 0;
-    file->config    = ctx;
-    file->tail_mode = mode;
     file->tag_len   = 0;
     file->tag_buf   = NULL;
     file->rotated   = 0;
@@ -1236,7 +1485,7 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
                                              ctx->buf_max_size);
 
         if (file->decompression_context == NULL) {
-            goto error;
+            goto err_free_hash_key;
         }
     }
 
@@ -1254,7 +1503,7 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
     ret = flb_tail_file_name_dup(path, file);
     if (!file->name) {
         flb_errno();
-        goto error;
+        goto err_free_decomp;
     }
 
     /* We keep a copy of the initial filename in orig_name. This is required
@@ -1262,9 +1511,7 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
     file->orig_name = flb_strdup(file->name);
     if (!file->orig_name) {
         flb_errno();
-        flb_free(file->name);
-        file->name = NULL;
-        goto error;
+        goto err_free_name;
     }
     file->orig_name_len = file->name_len;
 
@@ -1278,11 +1525,21 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
     file->dmode_flush_timeout = 0;
     file->dmode_complete = true;
     file->dmode_buf = flb_sds_create_size(ctx->docker_mode == FLB_TRUE ? 65536 : 0);
+    if (!file->dmode_buf) {
+        flb_errno();
+        goto err_destroy_sbuf;
+    }
     file->dmode_lastline = flb_sds_create_size(ctx->docker_mode == FLB_TRUE ? 20000 : 0);
+    if (!file->dmode_lastline) {
+        flb_errno();
+        goto err_free_dmode_buf;
+    }
     file->dmode_firstline = false;
 #ifdef FLB_HAVE_SQLDB
     file->db_id     = 0;
 #endif
+    file->db_offset_marker = 0;
+    file->db_offset_marker_size = 0;
     file->skip_next = FLB_FALSE;
     file->skip_warn = FLB_FALSE;
 
@@ -1309,7 +1566,7 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
                           "could not create multiline stream for file: %s",
                           inode_str);
             flb_sds_destroy(inode_str);
-            goto error;
+            goto err_free_dmode_lastline;
         }
         file->ml_stream_id = stream_id;
         flb_sds_destroy(inode_str);
@@ -1330,7 +1587,7 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
     file->buf_data = flb_malloc(file->buf_size);
     if (!file->buf_data) {
         flb_errno();
-        goto error;
+        goto err_destroy_ml_stream;
     }
 
     /* Initialize (optional) dynamic tag */
@@ -1340,7 +1597,7 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
         if (!tag) {
             flb_errno();
             flb_plg_error(ctx->ins, "failed to allocate tag buffer");
-            goto error;
+            goto err_free_buf_data;
         }
 #ifdef FLB_HAVE_REGEX
         ret = tag_compose(ctx->ins->tag, ctx->tag_regex, path, tag, &tag_len, ctx);
@@ -1354,7 +1611,7 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
         flb_free(tag);
         if (ret != 0) {
             flb_plg_error(ctx->ins, "failed to compose tag for file: %s", path);
-            goto error;
+            goto err_free_buf_data;
         }
     }
     else {
@@ -1364,38 +1621,68 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
     if (!file->tag_buf) {
         flb_plg_error(ctx->ins, "failed to set tag for file: %s", path);
         flb_errno();
-        goto error;
+        goto err_free_buf_data;
     }
 
     if (mode == FLB_TAIL_STATIC) {
         mk_list_add(&file->_head, &ctx->files_static);
         ctx->files_static_count++;
-        flb_hash_table_add(ctx->static_hash, file->hash_key, flb_sds_len(file->hash_key),
-                           file, sizeof(file));
+
+        ret = flb_hash_table_add(ctx->static_hash,
+                                 file->hash_key, flb_sds_len(file->hash_key),
+                                 file, sizeof(file));
+        if (ret < 0) {
+            flb_plg_error(ctx->ins, "could not register file in static hash");
+            goto err_unlist;
+        }
+
         tail_signal_manager(file->config);
     }
     else if (mode == FLB_TAIL_EVENT) {
         mk_list_add(&file->_head, &ctx->files_event);
-        flb_hash_table_add(ctx->event_hash, file->hash_key, flb_sds_len(file->hash_key),
-                           file, sizeof(file));
+
+        ret = flb_hash_table_add(ctx->event_hash,
+                                 file->hash_key, flb_sds_len(file->hash_key),
+                                 file, sizeof(file));
+        if (ret < 0) {
+            flb_plg_error(ctx->ins, "could not register file in event hash");
+            goto err_unlist;
+        }
 
         /* Register this file into the fs_event monitoring */
         ret = flb_tail_fs_add(ctx, file);
         if (ret == -1) {
             flb_plg_error(ctx->ins, "could not register file into fs_events");
-            goto error;
+            goto err_unlist;
         }
     }
 
     /* Set the file position (database offset, head or tail) */
-    ret = set_file_position(ctx, file);
+    ret = set_file_position(ctx, file, (offset != -1));
     if (ret == -1) {
-        flb_tail_file_remove(file);
-        goto error;
+        goto err_fs_remove;
     }
 
     /* Remaining bytes to read */
     file->pending_bytes = file->size - file->offset;
+
+    file->sl_log_event_encoder = flb_log_event_encoder_create(
+                                    FLB_LOG_EVENT_FORMAT_DEFAULT);
+
+    if (file->sl_log_event_encoder == NULL) {
+        goto err_set_pos;
+    }
+
+    file->ml_log_event_encoder = flb_log_event_encoder_create(
+                                    FLB_LOG_EVENT_FORMAT_DEFAULT);
+
+    if (file->ml_log_event_encoder == NULL) {
+        goto err_destroy_sl;
+    }
+
+    flb_plg_debug(ctx->ins,
+                  "inode=%"PRIu64" with offset=%"PRId64" appended as %s",
+                  file->inode, file->offset, path);
 
 #ifdef FLB_HAVE_METRICS
     name = (char *) flb_input_name(ctx->ins);
@@ -1406,41 +1693,66 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
     flb_metrics_sum(FLB_TAIL_METRIC_F_OPENED, 1, ctx->ins->metrics);
 #endif
 
-    file->sl_log_event_encoder = flb_log_event_encoder_create(
-                                    FLB_LOG_EVENT_FORMAT_DEFAULT);
-
-    if (file->sl_log_event_encoder == NULL) {
-        flb_tail_file_remove(file);
-
-        goto error;
-    }
-
-    file->ml_log_event_encoder = flb_log_event_encoder_create(
-                                    FLB_LOG_EVENT_FORMAT_DEFAULT);
-
-    if (file->ml_log_event_encoder == NULL) {
-        flb_tail_file_remove(file);
-
-        goto error;
-    }
-
-    flb_plg_debug(ctx->ins,
-                  "inode=%"PRIu64" with offset=%"PRId64" appended as %s",
-                  file->inode, file->offset, path);
     return 0;
 
-error:
-    if (file) {
-        if (file->buf_data) {
-            flb_free(file->buf_data);
-        }
-        if (file->name) {
-            flb_free(file->name);
-        }
-        flb_free(file);
+/*
+ * Cleanup ladder: each label undoes exactly one acquisition and falls
+ * through to the next. Failed-acquisition gotos jump to the label that
+ * cleans up the LAST resource that was successfully acquired, skipping
+ * the cleanup of the resource that was never created.
+ */
+err_destroy_sl:
+    flb_log_event_encoder_destroy(file->sl_log_event_encoder);
+err_set_pos:
+    /* set_file_position has no resource of its own; fall through */
+err_fs_remove:
+    if (mode == FLB_TAIL_EVENT) {
+        flb_tail_fs_remove(ctx, file);
     }
+err_unlist:
+    if (mode == FLB_TAIL_STATIC) {
+        mk_list_del(&file->_head);
+        if (ctx->files_static_count > 0) {
+            ctx->files_static_count--;
+        }
+        flb_hash_table_del(ctx->static_hash, file->hash_key);
+    }
+    else if (mode == FLB_TAIL_EVENT) {
+        mk_list_del(&file->_head);
+        flb_hash_table_del(ctx->event_hash, file->hash_key);
+    }
+    flb_free(file->tag_buf);
+err_free_buf_data:
+    flb_free(file->buf_data);
+err_destroy_ml_stream:
+    if (ctx->ml_ctx && file->ml_stream_id > 0) {
+        flb_ml_stream_id_destroy_all(ctx->ml_ctx, file->ml_stream_id);
+    }
+err_free_dmode_lastline:
+    flb_sds_destroy(file->dmode_lastline);
+err_free_dmode_buf:
+    flb_sds_destroy(file->dmode_buf);
+err_destroy_sbuf:
+    msgpack_sbuffer_destroy(&file->mult_sbuf);
+    /* orig_name was acquired immediately after name with no fallible step
+     * between, so its cleanup is folded into err_destroy_sbuf rather than
+     * carrying a label that no goto can reach */
+    flb_free(file->orig_name);
+err_free_name:
+    flb_free(file->name);
+    if (file->real_name) {
+        flb_free(file->real_name);
+    }
+err_free_decomp:
+    if (file->decompression_context) {
+        flb_decompression_context_destroy(file->decompression_context);
+    }
+err_free_hash_key:
+    flb_sds_destroy(file->hash_key);
+err_free_file:
+    flb_free(file);
+err_close_fd:
     close(fd);
-
     return -1;
 }
 
@@ -1494,6 +1806,11 @@ void flb_tail_file_remove(struct flb_tail_file *file)
 
     flb_sds_destroy(file->dmode_buf);
     flb_sds_destroy(file->dmode_lastline);
+
+    if (file->tail_mode == FLB_TAIL_STATIC && ctx->files_static_count > 0) {
+        ctx->files_static_count--;
+    }
+
     mk_list_del(&file->_head);
     flb_tail_fs_remove(ctx, file);
 
@@ -1668,8 +1985,9 @@ int flb_tail_file_remove_all(struct flb_tail_config *ctx)
 static int adjust_counters(struct flb_tail_config *ctx, struct flb_tail_file *file)
 {
     int ret;
-    int64_t offset;
     struct stat st;
+
+    (void) ctx;
 
     ret = fstat(file->fd, &st);
     if (ret == -1) {
@@ -1684,23 +2002,10 @@ static int adjust_counters(struct flb_tail_config *ctx, struct flb_tail_file *fi
 
     /* Check if the file was truncated by comparing current size with previous size */
     if (size_delta < 0) {
-        offset = lseek(file->fd, 0, SEEK_SET);
-        if (offset == -1) {
-            flb_errno();
+        if (flb_tail_file_reset_on_truncate(file, size_delta,
+                                            "adjust_counters") == -1) {
             return FLB_TAIL_ERROR;
         }
-
-        flb_plg_debug(ctx->ins, "adjust_counters: inode=%"PRIu64" file truncated %s (diff: %"PRId64" bytes)",
-                      file->inode, file->name, size_delta);
-        file->offset = offset;
-        file->buf_len = 0;
-
-        /* Update offset in the database file */
-#ifdef FLB_HAVE_SQLDB
-        if (ctx->db) {
-            flb_tail_db_file_offset(file, ctx);
-        }
-#endif
     }
     else {
         // Avoid negative pending_bytes when fstat() has stale data and size < offset
@@ -1756,11 +2061,7 @@ int flb_tail_file_chunk(struct flb_tail_file *file)
                 file->buf_len -= processed_bytes;
                 file->buf_data[file->buf_len] = '\0';
 
-#ifdef FLB_HAVE_SQLDB
-                if (file->config->db) {
-                    flb_tail_db_file_offset(file, file->config);
-                }
-#endif
+                update_resumable_offset_state(file);
                 return adjust_counters(ctx, file);
             }
         }
@@ -1944,11 +2245,7 @@ int flb_tail_file_chunk(struct flb_tail_file *file)
         file->buf_len -= processed_bytes;
         file->buf_data[file->buf_len] = '\0';
 
-#ifdef FLB_HAVE_SQLDB
-        if (file->config->db) {
-            flb_tail_db_file_offset(file, file->config);
-        }
-#endif
+        update_resumable_offset_state(file);
 
         /* adjust file counters, returns FLB_TAIL_OK or FLB_TAIL_ERROR */
         ret = adjust_counters(ctx, file);
@@ -1994,7 +2291,7 @@ int flb_tail_file_is_rotated(struct flb_tail_config *ctx,
 
     /* Check if the 'original monitored file' is a link and rotated */
     if (file->is_link == FLB_TRUE) {
-        ret = lstat(file->name, &st);
+        ret = tail_file_lstat(ctx, file->name, &st);
         if (ret == -1) {
             /* Broken link or missing file */
             if (errno == ENOENT) {
@@ -2029,7 +2326,7 @@ int flb_tail_file_is_rotated(struct flb_tail_config *ctx,
 
 
     /* Get stats from the file name */
-    ret = stat(name, &st);
+    ret = tail_file_stat(ctx, name, &st);
     if (ret == -1) {
         flb_errno();
         flb_free(name);
@@ -2084,14 +2381,21 @@ int flb_tail_file_to_event(struct flb_tail_file *file)
         return -1;
     }
 
+    ret = flb_hash_table_add(ctx->event_hash,
+                             file->hash_key, flb_sds_len(file->hash_key),
+                             file, sizeof(file));
+    if (ret < 0) {
+        flb_plg_error(ctx->ins, "could not register file in event hash");
+        flb_tail_fs_remove(ctx, file);
+        return -1;
+    }
+
     /* List swap: change from 'static' to 'event' list */
     mk_list_del(&file->_head);
     ctx->files_static_count--;
     flb_hash_table_del(ctx->static_hash, file->hash_key);
 
     mk_list_add(&file->_head, &file->config->files_event);
-    flb_hash_table_add(ctx->event_hash, file->hash_key, flb_sds_len(file->hash_key),
-                       file, sizeof(file));
 
     file->tail_mode = FLB_TAIL_EVENT;
 
@@ -2157,6 +2461,7 @@ char *flb_tail_file_name(struct flb_tail_file *file)
 
 #elif defined(FLB_SYSTEM_WINDOWS)
     int len;
+    wchar_t *wide_buf;
 
     h = (HANDLE) _get_osfhandle(file->fd);
     if (h == INVALID_HANDLE_VALUE) {
@@ -2168,14 +2473,41 @@ char *flb_tail_file_name(struct flb_tail_file *file)
     /* This function returns the length of the string excluding "\0"
      * and the resulting path has a "\\?\" prefix.
      */
-    len = GetFinalPathNameByHandleA(h, buf, PATH_MAX, FILE_NAME_NORMALIZED);
-    if (len == 0 || len >= PATH_MAX) {
-        flb_free(buf);
-        return NULL;
-    }
+    if (file->config->windows_path_encoding == FLB_TAIL_WINDOWS_PATH_ENCODING_UTF8) {
+        wide_buf = flb_calloc(PATH_MAX, sizeof(wchar_t));
+        if (wide_buf == NULL) {
+            flb_free(buf);
+            return NULL;
+        }
 
-    if (strstr(buf, "\\\\?\\")) {
-        memmove(buf, buf + 4, len + 1);
+        len = GetFinalPathNameByHandleW(h, wide_buf, PATH_MAX,
+                                        FILE_NAME_NORMALIZED);
+        if (len == 0 || len >= PATH_MAX) {
+            flb_free(wide_buf);
+            flb_free(buf);
+            return NULL;
+        }
+
+        len = (int) win32_remove_extended_path_prefix(wide_buf, (size_t) len);
+
+        flb_free(buf);
+        buf = win32_wide_to_utf8(wide_buf);
+        flb_free(wide_buf);
+
+        if (buf == NULL) {
+            return NULL;
+        }
+    }
+    else {
+        len = GetFinalPathNameByHandleA(h, buf, PATH_MAX, FILE_NAME_NORMALIZED);
+        if (len == 0 || len >= PATH_MAX) {
+            flb_free(buf);
+            return NULL;
+        }
+
+        if (strstr(buf, "\\\\?\\")) {
+            memmove(buf, buf + 4, len + 1);
+        }
     }
 #elif defined(FLB_SYSTEM_FREEBSD)
     if ((file_entries = kinfo_getfile(getpid(), &file_count)) == NULL) {
@@ -2270,7 +2602,7 @@ int flb_tail_file_rotated(struct flb_tail_file *file)
 #endif
 
         /* Check if a new file has been created */
-        ret = stat(tmp, &st);
+        ret = tail_file_stat(ctx, tmp, &st);
         if (ret == 0 && st.st_ino != file->inode) {
             if (flb_tail_file_exists(&st, ctx) == FLB_FALSE) {
                 ret = flb_tail_file_append(tmp, &st, FLB_TAIL_STATIC, -1, ctx);
@@ -2323,6 +2655,17 @@ static int check_purge_deleted_file(struct flb_tail_config *ctx,
             if ((ts - ctx->ignore_older) > mtime) {
                 flb_plg_debug(ctx->ins, "purge: monitored file (ignore older): %s",
                               file->name);
+                flb_tail_scan_register_aged_out_inode(ctx,
+                                                      file->name,
+                                                      strlen(file->name),
+                                                      file->inode);
+                /* Preserve read offset for re-pickup if mtime is later refreshed.
+                 * Use flb_tail_file_db_offset() rather than file->offset so that
+                 * any buffered but unparsed bytes are not skipped on re-pickup. */
+                flb_tail_scan_register_ignored_file_size(ctx,
+                                                         file->name,
+                                                         strlen(file->name),
+                                                         flb_tail_file_db_offset(file));
                 flb_tail_file_remove(file);
                 return FLB_TRUE;
             }

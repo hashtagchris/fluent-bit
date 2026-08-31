@@ -109,6 +109,51 @@ static void prometheus_encode_test(struct cmt *cmt)
     cmt_encode_prometheus_destroy(buf);
 }
 
+void test_histogram_non_finite_bucket_labels()
+{
+    /* Cover non-finite %g outputs like inf/nan. */
+    uint64_t ts;
+    cfl_sds_t buf;
+    struct cmt *cmt;
+    struct cmt_histogram *h;
+    struct cmt_histogram_buckets *buckets;
+
+    cmt_initialize();
+
+    ts = 0;
+    cmt = cmt_create();
+    TEST_CHECK(cmt != NULL);
+
+    buckets = cmt_histogram_buckets_create(3, -INFINITY, NAN, INFINITY);
+    TEST_CHECK(buckets != NULL);
+
+    h = cmt_histogram_create(cmt,
+                             "cm", "encoding", "non_finite_bucket",
+                             "Histogram non-finite bucket label",
+                             buckets,
+                             0, NULL);
+    TEST_CHECK(h != NULL);
+
+    cmt_histogram_observe(h, ts, 42.0, 0, NULL);
+
+    buf = cmt_encode_prometheus_create(cmt, CMT_TRUE);
+    TEST_CHECK(buf != NULL);
+    if (buf != NULL) {
+        TEST_CHECK(strstr(buf,
+                          "cm_encoding_non_finite_bucket_bucket{le=\"-inf\"} 0 0") != NULL);
+        TEST_CHECK(strstr(buf,
+                          "cm_encoding_non_finite_bucket_bucket{le=\"nan\"} 1 0") != NULL);
+        TEST_CHECK(strstr(buf,
+                          "cm_encoding_non_finite_bucket_bucket{le=\"inf\"} 1 0") != NULL);
+        TEST_CHECK(strstr(buf, "le=\"-inf.0\"") == NULL);
+        TEST_CHECK(strstr(buf, "le=\"nan.0\"") == NULL);
+        TEST_CHECK(strstr(buf, "le=\"inf.0\"") == NULL);
+        cmt_encode_prometheus_destroy(buf);
+    }
+
+    cmt_destroy(cmt);
+}
+
 
 void test_histogram()
 {
@@ -205,8 +250,61 @@ void test_set_defaults()
     cmt_destroy(cmt);
 }
 
+void test_prometheus_large_integer_bucket_precision()
+{
+    int ret;
+    uint64_t ts;
+    cfl_sds_t buf;
+    struct cmt *cmt;
+    struct cmt_histogram *h;
+    struct cmt_histogram_buckets *buckets;
+    uint64_t bucket_values[9] = {0};
+    double bucket_bounds[8] = {
+        100.0, 1024.0, 2048.0, 4096.0,
+        100.0 * 1024.0, 1024.0 * 1024.0,
+        4.0 * 1024.0 * 1024.0, 10.0 * 1024.0 * 1024.0
+    };
+
+    cmt_initialize();
+
+    ts = cfl_time_now();
+
+    cmt = cmt_create();
+    TEST_CHECK(cmt != NULL);
+
+    buckets = cmt_histogram_buckets_create_size(bucket_bounds,
+                                                sizeof(bucket_bounds) / sizeof(double));
+    TEST_CHECK(buckets != NULL);
+
+    h = cmt_histogram_create(cmt,
+                             "k8s", "network", "record_sizes", "Record sizes",
+                             buckets,
+                             0, NULL);
+    TEST_CHECK(h != NULL);
+
+    ret = cmt_histogram_set_default(h, ts,
+                                    bucket_values,
+                                    0.0, 0, 0, NULL);
+    TEST_CHECK(ret == 0);
+
+    buf = cmt_encode_prometheus_create(cmt, CMT_FALSE);
+    TEST_CHECK(buf != NULL);
+
+    TEST_CHECK(strstr(buf, "k8s_network_record_sizes_bucket{le=\"1048576.0\"}") != NULL);
+    TEST_CHECK(strstr(buf, "k8s_network_record_sizes_bucket{le=\"4194304.0\"}") != NULL);
+    TEST_CHECK(strstr(buf, "k8s_network_record_sizes_bucket{le=\"10485760.0\"}") != NULL);
+    TEST_CHECK(strstr(buf, "k8s_network_record_sizes_bucket{le=\"1.04858e+06\"}") == NULL);
+    TEST_CHECK(strstr(buf, "k8s_network_record_sizes_bucket{le=\"4.1943e+06\"}") == NULL);
+    TEST_CHECK(strstr(buf, "k8s_network_record_sizes_bucket{le=\"1.04858e+07\"}") == NULL);
+
+    cmt_encode_prometheus_destroy(buf);
+    cmt_destroy(cmt);
+}
+
 TEST_LIST = {
-    {"histogram"   , test_histogram},
-    {"set_defaults", test_set_defaults},
+    {"non_finite_bucket_labels"                 , test_histogram_non_finite_bucket_labels},
+    {"histogram"                                , test_histogram},
+    {"set_defaults"                             , test_set_defaults},
+    {"prometheus_large_integer_bucket_precision", test_prometheus_large_integer_bucket_precision},
     { 0 }
 };

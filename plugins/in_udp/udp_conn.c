@@ -23,6 +23,9 @@
 #include <fluent-bit/flb_network.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_error.h>
+#ifdef FLB_HAVE_PARSER
+#include <fluent-bit/flb_time.h>
+#endif
 
 #include "udp.h"
 #include "udp_conn.h"
@@ -43,7 +46,7 @@ static int append_message_to_record_data(char **result_buffer,
 {
     int                result = FLB_MAP_NOT_MODIFIED;
     char              *modified_data_buffer;
-    int                modified_data_size;
+    size_t             modified_data_size;
     msgpack_object_kv *new_map_entries[1];
     msgpack_object_kv  message_entry;
     *result_buffer = NULL;
@@ -111,6 +114,7 @@ static inline int process_pack(struct udp_conn *conn,
     int len;
 
     ctx = conn->ctx;
+    ret = FLB_EVENT_ENCODER_SUCCESS;
 
     flb_log_event_encoder_reset(ctx->log_encoder);
 
@@ -207,10 +211,19 @@ static inline int process_pack(struct udp_conn *conn,
     msgpack_unpacked_destroy(&result);
 
     if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-        flb_input_log_append(conn->ins, NULL, 0,
-                             ctx->log_encoder->output_buffer,
-                             ctx->log_encoder->output_length);
-        ret = 0;
+        if (ctx->log_encoder->output_length > 0) {
+            ret = udp_ingest_logs(ctx,
+                                  ctx->log_encoder->output_buffer,
+                                  ctx->log_encoder->output_length);
+            if (ret != 0) {
+                flb_plg_error(ctx->ins,
+                              "could not append UDP logs for %s:%s. ret=%d",
+                              ctx->listen, ctx->port, ret);
+                return -1;
+            }
+        }
+
+        return 0;
     }
     else {
         flb_plg_error(ctx->ins, "log event encoding error : %d", ret);
@@ -245,8 +258,12 @@ static ssize_t parse_payload_json(struct udp_conn *conn)
     }
 
     /* Process the packaged JSON and return the last byte used */
-    process_pack(conn, pack, out_size);
+    ret = process_pack(conn, pack, out_size);
     flb_free(pack);
+
+    if (ret != 0) {
+        return -1;
+    }
 
     return conn->pack_state.last_byte;
 }
@@ -264,6 +281,16 @@ static ssize_t parse_payload_none(struct udp_conn *conn)
     char *buf;
     char *s;
     char *separator;
+#ifdef FLB_HAVE_PARSER
+    size_t out_size;
+    int parser_ret;
+    void *out_buf;
+    struct flb_time out_time;
+    char *source_address;
+    char *appended_address_buffer;
+    size_t appended_address_size;
+    int append_result;
+#endif
     struct flb_in_udp_config *ctx;
 
     ctx = conn->ctx;
@@ -282,28 +309,144 @@ static ssize_t parse_payload_none(struct udp_conn *conn)
             break;
         }
         else if (len > 0) {
-            ret = flb_log_event_encoder_begin_record(ctx->log_encoder);
+#ifdef FLB_HAVE_PARSER
+            if (ctx->parser != NULL) {
+                out_buf = NULL;
+                out_size = 0;
+                source_address = NULL;
+                appended_address_buffer = NULL;
+                appended_address_size = 0;
+                flb_time_zero(&out_time);
 
-            if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-                ret = flb_log_event_encoder_set_current_timestamp(ctx->log_encoder);
+                parser_ret = flb_parser_do(ctx->parser, buf, len,
+                                           &out_buf, &out_size, &out_time);
+                if (parser_ret >= 0) {
+                    ret = flb_log_event_encoder_begin_record(ctx->log_encoder);
+
+                    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                        if (flb_time_to_nanosec(&out_time) == 0L) {
+                            flb_time_get(&out_time);
+                        }
+                        ret = flb_log_event_encoder_set_timestamp(
+                                ctx->log_encoder, &out_time);
+                    }
+
+                    if (ctx->source_address_key != NULL) {
+                        source_address = flb_connection_get_remote_address(
+                                            conn->connection);
+                    }
+
+                    if (ret == FLB_EVENT_ENCODER_SUCCESS &&
+                        source_address != NULL) {
+                        append_result = append_message_to_record_data(
+                                &appended_address_buffer,
+                                &appended_address_size,
+                                ctx->source_address_key,
+                                out_buf,
+                                out_size,
+                                source_address,
+                                strlen(source_address),
+                                MSGPACK_OBJECT_STR);
+                        if (append_result != FLB_MAP_EXPAND_SUCCESS) {
+                            if (appended_address_buffer != NULL) {
+                                flb_free(appended_address_buffer);
+                            }
+                            appended_address_buffer = NULL;
+                            appended_address_size = 0;
+                        }
+                    }
+
+                    if (ret == FLB_EVENT_ENCODER_SUCCESS &&
+                        appended_address_buffer != NULL) {
+                        ret = flb_log_event_encoder_set_body_from_raw_msgpack(
+                                ctx->log_encoder, appended_address_buffer,
+                                appended_address_size);
+                    }
+                    else if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                        ret = flb_log_event_encoder_set_body_from_raw_msgpack(
+                                ctx->log_encoder, out_buf, out_size);
+                    }
+
+                    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                        ret = flb_log_event_encoder_commit_record(
+                                ctx->log_encoder);
+                    }
+                }
+                else {
+                    source_address = NULL;
+                    appended_address_buffer = NULL;
+                    appended_address_size = 0;
+
+                    flb_plg_debug(ctx->ins, "parser '%s' failed on incoming data",
+                                  ctx->parser_name);
+                    ret = flb_log_event_encoder_begin_record(ctx->log_encoder);
+
+                    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                        ret = flb_log_event_encoder_set_current_timestamp(
+                                ctx->log_encoder);
+                    }
+
+                    if (ctx->source_address_key != NULL) {
+                        source_address = flb_connection_get_remote_address(
+                                            conn->connection);
+                    }
+
+                    if (ret == FLB_EVENT_ENCODER_SUCCESS && source_address != NULL) {
+                        ret = flb_log_event_encoder_append_body_values(
+                                ctx->log_encoder,
+                                FLB_LOG_EVENT_CSTRING_VALUE("log"),
+                                FLB_LOG_EVENT_STRING_VALUE(buf, len),
+                                FLB_LOG_EVENT_CSTRING_VALUE(ctx->source_address_key),
+                                FLB_LOG_EVENT_CSTRING_VALUE(source_address));
+                    }
+                    else if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                        ret = flb_log_event_encoder_append_body_values(
+                                ctx->log_encoder,
+                                FLB_LOG_EVENT_CSTRING_VALUE("log"),
+                                FLB_LOG_EVENT_STRING_VALUE(buf, len));
+                    }
+
+                    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                        ret = flb_log_event_encoder_commit_record(
+                                ctx->log_encoder);
+                    }
+                }
+
+                if (parser_ret >= 0 && out_buf != NULL) {
+                    flb_free(out_buf);
+                }
+                if (appended_address_buffer != NULL) {
+                    flb_free(appended_address_buffer);
+                }
             }
+            else
+#endif
+            {
+                ret = flb_log_event_encoder_begin_record(ctx->log_encoder);
 
-            if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-                ret = flb_log_event_encoder_append_body_values(
-                        ctx->log_encoder,
-                        FLB_LOG_EVENT_CSTRING_VALUE("log"),
-                        FLB_LOG_EVENT_STRING_VALUE(buf, len));
-            }
+                if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                    ret = flb_log_event_encoder_set_current_timestamp(
+                            ctx->log_encoder);
+                }
 
-            if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-                ret = flb_log_event_encoder_commit_record(ctx->log_encoder);
+                if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                    ret = flb_log_event_encoder_append_body_values(
+                            ctx->log_encoder,
+                            FLB_LOG_EVENT_CSTRING_VALUE("log"),
+                            FLB_LOG_EVENT_STRING_VALUE(buf, len));
+                }
+
+                if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                    ret = flb_log_event_encoder_commit_record(
+                            ctx->log_encoder);
+                }
             }
 
             if (ret != FLB_EVENT_ENCODER_SUCCESS) {
                 break;
             }
 
-            consumed += len + 1;
+            consumed += len + sep_len;
             buf += len + sep_len;
         }
         else {
@@ -312,9 +455,17 @@ static ssize_t parse_payload_none(struct udp_conn *conn)
     }
 
     if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-        flb_input_log_append(conn->ins, NULL, 0,
-                             ctx->log_encoder->output_buffer,
-                             ctx->log_encoder->output_length);
+        if (ctx->log_encoder->output_length > 0) {
+            ret = udp_ingest_logs(ctx,
+                                  ctx->log_encoder->output_buffer,
+                                  ctx->log_encoder->output_length);
+            if (ret != 0) {
+                flb_plg_error(ctx->ins,
+                              "could not append UDP logs for %s:%s. ret=%d",
+                              ctx->listen, ctx->port, ret);
+                return -1;
+            }
+        }
     }
     else {
         flb_plg_error(ctx->ins, "log event encoding error : %d", ret);

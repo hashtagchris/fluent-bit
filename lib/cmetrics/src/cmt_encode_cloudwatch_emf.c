@@ -25,6 +25,7 @@
 #include <cmetrics/cmt_untyped.h>
 #include <cmetrics/cmt_histogram.h>
 #include <cmetrics/cmt_exp_histogram.h>
+#include <cmetrics/cmt_atomic.h>
 #include <cmetrics/cmt_summary.h>
 #include <cmetrics/cmt_time.h>
 #include <cmetrics/cmt_compat.h>
@@ -71,7 +72,7 @@ static void pack_basic_header(mpack_writer_t *writer, struct cmt *cmt,
     mpack_start_array(writer, labels);
     cfl_list_foreach(head, &map->label_keys) {
         label_k = cfl_list_entry(head, struct cmt_map_label, _head);
-        mpack_write_cstr(writer, label_k->name);
+        mpack_write_cstr(writer, label_k->name != NULL ? label_k->name : "");
     }
 
     cfl_list_foreach(head, &cmt->static_labels->list) {
@@ -194,7 +195,7 @@ static void pack_histogram_metric(mpack_writer_t *writer, struct cmt *cmt,
         val = cmt_metric_hist_get_sum_value(metric);
     }
     else {
-        val = cmt_math_uint64_to_d64(metric->exp_hist_sum);
+        val = cmt_math_uint64_to_d64(cmt_atomic_load(&metric->exp_hist_sum));
     }
     mpack_write_double(writer, val);
     mpack_write_cstr(writer, "Count");
@@ -202,7 +203,7 @@ static void pack_histogram_metric(mpack_writer_t *writer, struct cmt *cmt,
         val = cmt_metric_hist_get_count_value(metric);
     }
     else {
-        val = metric->exp_hist_count;
+        val = exp_bucket_counts[exp_bucket_count - 1];
     }
     mpack_write_double(writer, val);
     mpack_finish_map(writer);
@@ -245,6 +246,8 @@ static int pack_metric(mpack_writer_t *writer, struct cmt *cmt,
     double val = 0.0;
     int c_labels = 0;
     int static_labels = 0;
+    int label_key_count;
+    int label_index;
     struct cfl_list      *head;
     struct cmt_map_label *label_k;
     struct cmt_map_label *label_v;
@@ -252,6 +255,7 @@ static int pack_metric(mpack_writer_t *writer, struct cmt *cmt,
     struct cmt_opts      *opts   = map->opts;
 
     c_labels = cfl_list_size(&metric->labels);
+    label_key_count = map->label_count;
     s = 3;
 
     if (c_labels > 0) {
@@ -293,14 +297,20 @@ static int pack_metric(mpack_writer_t *writer, struct cmt *cmt,
     pack_basic_header_finish(writer);
 
     /* dimensions */
-    if (c_labels > 0) {
+    if (c_labels > 0 && label_key_count > 0) {
         label_k = cfl_list_entry_first(&map->label_keys, struct cmt_map_label, _head);
 
+        label_index = 0;
         cfl_list_foreach(head, &metric->labels) {
-            label_v = cfl_list_entry(head, struct cmt_map_label, _head);
-            mpack_write_cstr(writer, label_k->name);
-            mpack_write_cstr(writer, label_v->name);
+            if (label_index >= label_key_count) {
+                break;
+            }
 
+            label_v = cfl_list_entry(head, struct cmt_map_label, _head);
+            mpack_write_cstr(writer, label_k->name != NULL ? label_k->name : "");
+            mpack_write_cstr(writer, label_v->name != NULL ? label_v->name : "");
+
+            label_index++;
             label_k = cfl_list_entry_next(&label_k->_head, struct cmt_map_label,
                                           _head, &map->label_keys);
         }

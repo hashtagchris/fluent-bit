@@ -27,6 +27,11 @@ endmacro()
 FLB_RT_CORE_TEST(FLB_COROUTINE_TIMEOUT    "core-timeout.c")
 FLB_RT_CORE_TEST(FLB_INTERNAL_LOGGER      "core_internal_logger.c")
 FLB_RT_CORE_TEST(FLB_DOWNSTREAM_ACCEPT_TIMEOUT "core_accept_timeout.c")
+# Uses POSIX alarm()/sigaction() for a watchdog; skip on Windows.
+if(NOT FLB_SYSTEM_WINDOWS)
+  FLB_RT_CORE_TEST(FLB_CORE_SHUTDOWN_SPIN   "core_shutdown_spin.c")
+endif()
+FLB_RT_CORE_TEST(1 "http_client_chunked.c")
 
 FLB_RT_TEST(FLB_CHUNK_TRACE "core_chunk_trace.c")
 
@@ -62,7 +67,9 @@ if(FLB_OUT_LIB)
   FLB_RT_TEST(FLB_IN_FLUENTBIT_METRICS "in_fluentbit_metrics.c")
   FLB_RT_TEST(FLB_IN_PROMETHEUS_TEXTFILE "in_prometheus_textfile.c")
   FLB_RT_TEST(FLB_IN_KUBERNETES_EVENTS "in_kubernetes_events.c")
-  FLB_RT_TEST(FLB_IN_OPENTELEMETRY "in_opentelemetry_routing.c")
+  if(FLB_HAVE_LIBYAML)
+    FLB_RT_TEST(FLB_IN_OPENTELEMETRY "in_opentelemetry_routing.c")
+  endif()
   if (FLB_IN_SYSTEMD)
     FLB_RT_TEST(FLB_IN_SYSTEMD        "in_systemd.c")
   endif ()
@@ -70,7 +77,7 @@ endif()
 
 if (FLB_CUSTOM_CALYPTIA)
     set(CALYPTIA_TEST_LINK_LIBS
-        fluent-bit-static
+        ${FLB_TEST_LINK_LIBRARY}
         ${CMAKE_THREAD_LIBS_INIT}
     )
 
@@ -85,11 +92,14 @@ if (FLB_CUSTOM_CALYPTIA)
         get_filename_component(TEST_NAME ${TEST_SOURCE} NAME_WE)
 
         set(TEST_TARGET "flb-rt-${TEST_NAME}")
-        add_executable(${TEST_TARGET}
-            ${TEST_SOURCE}
-            "../../plugins/custom_calyptia/calyptia.c"
-            "../../plugins/in_calyptia_fleet/in_calyptia_fleet.c"
-        )
+        add_executable(${TEST_TARGET} ${TEST_SOURCE})
+
+        if("${FLB_TEST_LINK_LIBRARY}" STREQUAL "fluent-bit-static")
+            target_sources(${TEST_TARGET} PRIVATE
+                "../../plugins/custom_calyptia/calyptia.c"
+                "../../plugins/in_calyptia_fleet/in_calyptia_fleet.c"
+            )
+        endif()
 
         target_link_libraries(${TEST_TARGET}
             ${CALYPTIA_TEST_LINK_LIBS}
@@ -100,8 +110,12 @@ if (FLB_CUSTOM_CALYPTIA)
                  WORKING_DIRECTORY ${CMAKE_HOME_DIRECTORY}/build)
 
         set_tests_properties(${TEST_TARGET} PROPERTIES LABELS "runtime")
-        add_dependencies(${TEST_TARGET} fluent-bit-static)
+        add_dependencies(${TEST_TARGET} ${FLB_TEST_LINK_LIBRARY})
     endforeach()
+endif()
+
+if(FLB_IN_LIB AND FLB_OUT_HTTP AND FLB_OUT_NULL AND FLB_IN_STORAGE_BACKLOG)
+  FLB_RT_TEST(FLB_IN_STORAGE_BACKLOG "in_storage_backlog.c")
 endif()
 
 if(FLB_IN_EBPF)
@@ -111,7 +125,7 @@ if(FLB_IN_EBPF)
     )
 
     set(EBPF_TEST_LINK_LIBS
-        fluent-bit-static
+        ${FLB_TEST_LINK_LIBRARY}
         ${CMAKE_THREAD_LIBS_INIT}
         ${SYSTEMD_LIB}
         -lbpf
@@ -165,9 +179,37 @@ if(FLB_IN_EBPF)
         "../../plugins/in_ebpf/traces/malloc/handler.c"
     )
 
-    add_dependencies(flb-rt-in_ebpf_bind_handler fluent-bit-static)
-    add_dependencies(flb-rt-in_ebpf_signal_handler fluent-bit-static)
-    add_dependencies(flb-rt-in_ebpf_malloc_handler fluent-bit-static)
+    add_ebpf_handler_test(
+        "tcp"
+        "in_ebpf_tcp_handler.c"
+        "../../plugins/in_ebpf/traces/tcp/handler.c"
+    )
+
+    add_ebpf_handler_test(
+        "exec"
+        "in_ebpf_exec_handler.c"
+        "../../plugins/in_ebpf/traces/exec/handler.c"
+    )
+
+    add_ebpf_handler_test(
+        "openssl"
+        "in_ebpf_openssl_handler.c"
+        "../../plugins/in_ebpf/traces/openssl/handler.c"
+    )
+
+    add_ebpf_handler_test(
+        "sched"
+        "in_ebpf_sched_handler.c"
+        "../../plugins/in_ebpf/traces/sched/handler.c"
+    )
+
+    add_dependencies(flb-rt-in_ebpf_bind_handler ${FLB_TEST_LINK_LIBRARY})
+    add_dependencies(flb-rt-in_ebpf_signal_handler ${FLB_TEST_LINK_LIBRARY})
+    add_dependencies(flb-rt-in_ebpf_malloc_handler ${FLB_TEST_LINK_LIBRARY})
+    add_dependencies(flb-rt-in_ebpf_tcp_handler ${FLB_TEST_LINK_LIBRARY})
+    add_dependencies(flb-rt-in_ebpf_exec_handler ${FLB_TEST_LINK_LIBRARY})
+    add_dependencies(flb-rt-in_ebpf_openssl_handler ${FLB_TEST_LINK_LIBRARY})
+    add_dependencies(flb-rt-in_ebpf_sched_handler ${FLB_TEST_LINK_LIBRARY})
 
 endif()
 
@@ -195,6 +237,13 @@ if(FLB_IN_LIB AND FLB_OUT_LIB)
   endif ()
   FLB_RT_TEST(FLB_FILTER_ECS       "filter_ecs.c")
   FLB_RT_TEST(FLB_FILTER_LOG_TO_METRICS       "filter_log_to_metrics.c")
+  if(FLB_IN_LIB)
+    FLB_RT_TEST(FLB_FILTER_GREP "filter_counter_semantics.c")
+  endif()
+endif()
+
+if(FLB_IN_LIB AND FLB_FILTER_GREP AND FLB_OUT_NULL AND FLB_OUT_HTTP)
+  FLB_RT_TEST(FLB_IN_LIB "counter_parity_e2e.c")
 endif()
 
 
@@ -205,6 +254,7 @@ if(FLB_IN_LIB)
   FLB_RT_TEST(FLB_OUT_LIB              "core_routes.c")
   FLB_RT_TEST(FLB_OUT_LIB              "config_map_opts.c")
   FLB_RT_TEST(FLB_OUT_COUNTER          "out_counter.c")
+  FLB_RT_TEST(FLB_OUT_AZURE_BLOB       "out_azure_blob_compression.c")
   FLB_RT_TEST(FLB_OUT_AZURE_KUSTO      "out_azure_kusto.c")
   FLB_RT_TEST(FLB_OUT_DATADOG          "out_datadog.c")
   FLB_RT_TEST(FLB_OUT_SKYWALKING       "out_skywalking.c")
@@ -216,6 +266,7 @@ if(FLB_IN_LIB)
   FLB_RT_TEST(FLB_OUT_HTTP             "out_http.c")
   FLB_RT_TEST(FLB_OUT_KAFKA            "out_kafka.c")
   FLB_RT_TEST(FLB_OUT_LIB              "out_lib.c")
+  FLB_RT_TEST(FLB_OUT_LOGDNA           "out_logdna.c")
   FLB_RT_TEST(FLB_OUT_LOKI             "out_loki.c")
   FLB_RT_TEST(FLB_OUT_NULL             "out_null.c")
   FLB_RT_TEST(FLB_OUT_PLOT             "out_plot.c")
@@ -232,11 +283,18 @@ if(FLB_IN_LIB)
   FLB_RT_TEST(FLB_OUT_CLOUDWATCH_LOGS   "out_cloudwatch.c")
   FLB_RT_TEST(FLB_OUT_KINESIS_FIREHOSE  "out_firehose.c")
   FLB_RT_TEST(FLB_OUT_KINESIS_STREAMS   "out_kinesis.c")
-    # These plugins work only on Linux
-  if(NOT FLB_SYSTEM_WINDOWS)
-    FLB_RT_TEST(FLB_OUT_FILE              "out_file.c")
+  if(FLB_OUT_FORWARD AND FLB_OUT_LOKI)
+    if (FLB_RECORD_ACCESSOR AND FLB_OUT_STACKDRIVER)
+      FLB_RT_TEST(FLB_OUT_LIB "group_counter_semantics.c")
+    endif()
   endif()
+  FLB_RT_TEST(FLB_OUT_FILE              "out_file.c")
+  FLB_RT_TEST(FLB_OUT_FILE              "out_file_rotation.c")
   FLB_RT_TEST(FLB_OUT_S3                "out_s3.c")
+  FLB_RT_TEST(FLB_OUT_GCS               "out_gcs.c")
+  if (FLB_IN_OPENTELEMETRY AND FLB_OUT_S3)
+    FLB_RT_TEST(FLB_OUT_S3              "out_s3_otlp_json.c")
+  endif()
   FLB_RT_TEST(FLB_OUT_TD                "out_td.c")
   FLB_RT_TEST(FLB_OUT_INFLUXDB          "out_influxdb.c")
   FLB_RT_TEST(FLB_OUT_CHRONICLE         "out_chronicle.c")
@@ -255,6 +313,11 @@ if (FLB_PROCESSOR_CONTENT_MODIFIER)
   FLB_RT_TEST(FLB_PROCESSOR_CONTENT_MODIFIER "processor_content_modifier.c")
 endif()
 
+if (FLB_PROCESSOR_CUMULATIVE_TO_DELTA)
+  FLB_RT_TEST(FLB_PROCESSOR_CUMULATIVE_TO_DELTA
+              "processor_cumulative_to_delta.c")
+endif()
+
 # HTTP Client Debug (requires -DFLB_HTTP_CLIENT_DEBUG=On)
 if(FLB_HTTP_CLIENT_DEBUG)
   FLB_RT_TEST(FLB_OUT_TD           "http_callbacks.c")
@@ -265,10 +328,29 @@ if(FLB_HAVE_SYSTEMD)
     set(SYSTEMD_LIB, "systemd")
 endif()
 
-set(FLB_TESTS_DATA_PATH ${CMAKE_CURRENT_SOURCE_DIR})
+if(FLB_SYSTEM_WINDOWS)
+  set(FLB_TESTS_DATA_PATH ${CMAKE_CURRENT_BINARY_DIR})
+  file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/data"
+       DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
+  configure_file("${PROJECT_SOURCE_DIR}/conf/parsers.conf"
+                 "${CMAKE_CURRENT_BINARY_DIR}/data/common/parsers.conf"
+                 COPYONLY)
+else()
+  set(FLB_TESTS_DATA_PATH ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
 configure_file(
   "${CMAKE_CURRENT_SOURCE_DIR}/flb_tests_runtime.h.in"
   "${CMAKE_CURRENT_SOURCE_DIR}/flb_tests_runtime.h"
+  )
+
+set(FLB_RT_SIMPLE_SYSTEMS_TESTS
+  in_cpu.c
+  in_disk.c
+  in_dummy.c
+  in_head.c
+  in_mem.c
+  in_proc.c
+  in_random.c
   )
 
 foreach(source_file ${CHECK_PROGRAMS})
@@ -277,13 +359,22 @@ foreach(source_file ${CHECK_PROGRAMS})
   if(FLB_WITHOUT_${source_file_we})
     message("Skipping test ${source_file_we}")
   else()
+    set(resolved_source_file ${source_file})
+    list(FIND FLB_RT_SIMPLE_SYSTEMS_TESTS ${source_file} simple_systems_test)
+    if(NOT simple_systems_test EQUAL -1)
+      set(resolved_source_file in_simple_systems.c)
+    endif()
+
     add_executable(
       ${source_file_we}
-      ${source_file}
+      ${resolved_source_file}
       )
     add_sanitizers(${source_file_we})
+    if(MSVC AND o_source_file_we STREQUAL "filter_aws")
+      target_compile_options(${source_file_we} PRIVATE /Zc:preprocessor)
+    endif()
     target_link_libraries(${source_file_we}
-      fluent-bit-static
+      ${FLB_TEST_LINK_LIBRARY}
       ${CMAKE_THREAD_LIBS_INIT}
       ${SYSTEMD_LIB}
       )
@@ -297,3 +388,26 @@ foreach(source_file ${CHECK_PROGRAMS})
     set_property(TARGET ${source_file_we} APPEND_STRING PROPERTY COMPILE_FLAGS "-D${o_source_file_we}")
   endif()
 endforeach()
+
+function(flb_runtime_lock_tests resource_name)
+  foreach(test_name ${ARGN})
+    if (TEST ${test_name})
+      set_property(TEST ${test_name} APPEND PROPERTY RESOURCE_LOCK "${resource_name}")
+    endif()
+  endforeach()
+endfunction()
+
+# Most runtime tests can run concurrently under `ctest -j`.
+# Only serialize executables that bind the same well-known port.
+flb_runtime_lock_tests("runtime-port-2020"
+  flb-rt-core_internal_logger
+  flb-rt-filter_wasm)
+
+flb_runtime_lock_tests("runtime-port-4318"
+  flb-rt-in_opentelemetry
+  flb-rt-in_opentelemetry_routing
+  flb-rt-processor_cumulative_to_delta)
+
+flb_runtime_lock_tests("runtime-port-5170"
+  flb-rt-in_tcp
+  flb-rt-out_tcp)

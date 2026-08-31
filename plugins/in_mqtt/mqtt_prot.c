@@ -256,6 +256,7 @@ static int mqtt_handle_connect(struct mqtt_conn *conn)
  */
 static int mqtt_handle_publish(struct mqtt_conn *conn)
 {
+    int frame_avail;
     int topic;
     int topic_len;
     uint8_t qos;
@@ -275,12 +276,19 @@ static int mqtt_handle_publish(struct mqtt_conn *conn)
     conn->buf_pos++;
 
     /* Topic */
+    frame_avail = conn->buf_frame_end - conn->buf_pos + 1;
+    if (frame_avail < 2) {
+        flb_plg_debug(ctx->ins, "truncated publish topic length");
+        return -1;
+    }
+
     hlen = BUFC() << 8;
     conn->buf_pos++;
     hlen |= BUFC();
 
     /* Validate topic length against current buffer capacity (overflow) */
-    if (hlen > (conn->buf_len - conn->buf_pos)) {
+    frame_avail = conn->buf_frame_end - conn->buf_pos + 1;
+    if (hlen > frame_avail) {
         flb_plg_debug(ctx->ins, "invalid topic length");
         return -1;
     }
@@ -293,6 +301,12 @@ static int mqtt_handle_publish(struct mqtt_conn *conn)
     /* Check QOS flag and respond if required */
     if (qos > MQTT_QOS_LEV0) {
         /* Packet Identifier */
+        frame_avail = conn->buf_frame_end - conn->buf_pos + 1;
+        if (frame_avail < 2) {
+            flb_plg_debug(ctx->ins, "truncated publish packet id");
+            return -1;
+        }
+
         packet_id = BUFC() << 8;
         conn->buf_pos++;
         packet_id |= BUFC();
@@ -316,6 +330,11 @@ static int mqtt_handle_publish(struct mqtt_conn *conn)
     }
 
     /* Message */
+    if (conn->buf_pos > conn->buf_frame_end + 1) {
+        flb_plg_debug(ctx->ins, "truncated publish payload");
+        return -1;
+    }
+
     mqtt_data_append((char *) (conn->buf + topic), topic_len,
                      (char *) (conn->buf + conn->buf_pos),
                      conn->buf_frame_end - conn->buf_pos + 1,
@@ -397,7 +416,7 @@ int mqtt_prot_parser(struct mqtt_conn *conn)
                     return MQTT_ERROR;
                 }
 
-                if (length + 2 > (conn->buf_len - pos)) {
+                if (length + (conn->buf_pos - pos + 1) > (conn->buf_len - pos)) {
                     conn->buf_pos = pos;
                     flb_plg_trace(ctx->ins, "[fd=%i] Need more data",
                                   conn->connection->fd);
@@ -405,7 +424,7 @@ int mqtt_prot_parser(struct mqtt_conn *conn)
                 }
 
                 if ((BUFC() & 128) == 0) {
-                    if (conn->buf_len - 2 < length) {
+                    if (conn->buf_len - (conn->buf_pos - pos + 1) < length) {
                         conn->buf_pos = pos;
                         flb_plg_trace(ctx->ins, "[fd=%i] Need more data",
                                       conn->connection->fd);

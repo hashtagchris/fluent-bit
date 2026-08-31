@@ -48,6 +48,11 @@
 #define FLB_TAIL_METRIC_L_SKIPPED 105  /* number of skipped occurrences of long lines */
 #endif
 
+#ifdef FLB_SYSTEM_WINDOWS
+#define FLB_TAIL_WINDOWS_PATH_ENCODING_ANSI 0
+#define FLB_TAIL_WINDOWS_PATH_ENCODING_UTF8 1
+#endif
+
 struct flb_tail_config {
     int fd_notify;             /* inotify fd               */
     flb_pipefd_t ch_manager[2];    /* pipe: channel manager    */
@@ -75,11 +80,11 @@ struct flb_tail_config {
     int coll_fd_inactive;
     int coll_fd_dmode_flush;
     int coll_fd_mult_flush;
-    int coll_fd_progress_check;
 
     /* Backend collectors */
     int coll_fd_fs1;           /* used by fs_inotify & fs_stat */
     int coll_fd_fs2;           /* only used by fs_stat         */
+    int coll_fd_progress_check; /* inotify missed-event recovery timer */
 
     /* Configuration */
     int dynamic_tag;           /* dynamic tag ? e.g: abc.*     */
@@ -99,6 +104,9 @@ struct flb_tail_config {
                                     * being ingested */
     time_t last_pending;       /* last time a 'pending signal' was emitted' */
     struct mk_list *path_list; /* list of paths to scan (glob) */
+#ifdef FLB_SYSTEM_WINDOWS
+    int windows_path_encoding; /* Windows path API encoding mode */
+#endif
     flb_sds_t path_key;        /* key name of file path        */
     flb_sds_t key;             /* key for unstructured record  */
     int   skip_long_lines;     /* skip long lines              */
@@ -189,6 +197,7 @@ struct flb_tail_config {
     struct flb_hash_table *event_hash;
 
     struct flb_hash_table *ignored_file_sizes;
+    struct flb_hash_table *aged_out_file_inodes;
 
     struct flb_config *config;
 };

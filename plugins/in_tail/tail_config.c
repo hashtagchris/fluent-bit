@@ -110,6 +110,9 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
 #ifdef FLB_HAVE_SQLDB
     ctx->db_sync = 1;  /* sqlite sync 'normal' */
 #endif
+#ifdef FLB_SYSTEM_WINDOWS
+    ctx->windows_path_encoding = FLB_TAIL_WINDOWS_PATH_ENCODING_ANSI;
+#endif
 #ifdef FLB_HAVE_UNICODE_ENCODER
     ctx->preferred_input_encoding = FLB_UNICODE_ENCODING_UNSPECIFIED;
 #endif
@@ -196,6 +199,24 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
         flb_tail_config_destroy(ctx);
         return NULL;
     }
+
+#ifdef FLB_SYSTEM_WINDOWS
+    tmp = flb_input_get_property("windows.path_encoding", ins);
+    if (tmp) {
+        if (strcasecmp(tmp, "ansi") == 0) {
+            ctx->windows_path_encoding = FLB_TAIL_WINDOWS_PATH_ENCODING_ANSI;
+        }
+        else if (strcasecmp(tmp, "utf-8") == 0 ||
+                 strcasecmp(tmp, "utf8") == 0) {
+            ctx->windows_path_encoding = FLB_TAIL_WINDOWS_PATH_ENCODING_UTF8;
+        }
+        else {
+            flb_plg_error(ctx->ins, "invalid 'windows.path_encoding' value %s", tmp);
+            flb_tail_config_destroy(ctx);
+            return NULL;
+        }
+    }
+#endif
 
 #ifdef FLB_HAVE_UNICODE_ENCODER
     tmp = flb_input_get_property("unicode.encoding", ins);
@@ -306,6 +327,13 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
     ctx->ignored_file_sizes = flb_hash_table_create(FLB_HASH_TABLE_EVICT_NONE, 1000, 0);
     if (ctx->ignored_file_sizes == NULL) {
         flb_plg_error(ctx->ins, "could not create ignored file size hash table");
+        flb_tail_config_destroy(ctx);
+        return NULL;
+    }
+
+    ctx->aged_out_file_inodes = flb_hash_table_create(FLB_HASH_TABLE_EVICT_NONE, 1000, 0);
+    if (ctx->aged_out_file_inodes == NULL) {
+        flb_plg_error(ctx->ins, "could not create aged out file inode hash table");
         flb_tail_config_destroy(ctx);
         return NULL;
     }
@@ -636,6 +664,10 @@ int flb_tail_config_destroy(struct flb_tail_config *config)
 
     if (config->ignored_file_sizes != NULL) {
         flb_hash_table_destroy(config->ignored_file_sizes);
+    }
+
+    if (config->aged_out_file_inodes != NULL) {
+        flb_hash_table_destroy(config->aged_out_file_inodes);
     }
 
     flb_free(config);

@@ -22,11 +22,20 @@
 #include <fluent-bit/flb_mp.h>
 #include <fluent-bit/flb_hash.h>
 #include <fluent-bit/flb_crypto.h>
+#include <fluent-bit/flb_base64.h>
 #include <fluent-bit/flb_record_accessor.h>
 #include <fluent-bit/flb_log_event_encoder.h>
 #include <fluent-bit/flb_log_event_decoder.h>
 
 #include "forward.h"
+
+static inline int forward_event_type_is_non_log(int event_type)
+{
+    return event_type == FLB_EVENT_TYPE_METRICS ||
+           event_type == FLB_EVENT_TYPE_TRACES  ||
+           event_type == FLB_EVENT_TYPE_PROFILES ||
+           event_type == FLB_EVENT_TYPE_BLOBS;
+}
 
 void flb_forward_format_bin_to_hex(uint8_t *buf, size_t len, char *out)
 {
@@ -91,6 +100,7 @@ static int append_options(struct flb_forward *ctx,
                           char *out_chunk)
 {
     char *chunk = NULL;
+    size_t chunk_len = 0;
     uint8_t checksum[64];
     int     result;
     struct mk_list *head;
@@ -104,8 +114,9 @@ static int append_options(struct flb_forward *ctx,
 
     if (fc->require_ack_response == FLB_TRUE) {
         /*
-         * for ack we calculate  sha512 of context, take 16 bytes,
-         * make 32 byte hex string of it
+         * The 'chunk' ack token is a Base64 representation of a 128 bits
+         * unique id: we take the first 16 bytes of the SHA512 checksum of
+         * the payload content.
          */
         result = flb_hash_simple(FLB_HASH_SHA512,
                                  data, bytes,
@@ -115,9 +126,13 @@ static int append_options(struct flb_forward *ctx,
             return -1;
         }
 
-        flb_forward_format_bin_to_hex(checksum, 16, out_chunk);
+        result = flb_base64_encode((unsigned char *) out_chunk,
+                                   FLB_FORWARD_CHUNK_TOKEN_SIZE, &chunk_len,
+                                   checksum, 16);
+        if (result != 0) {
+            return -1;
+        }
 
-        out_chunk[32] = '\0';
         chunk = (char *) out_chunk;
     }
 
@@ -126,8 +141,8 @@ static int append_options(struct flb_forward *ctx,
         flb_mp_map_header_append(&mh);
         msgpack_pack_str(mp_pck, 5);
         msgpack_pack_str_body(mp_pck, "chunk", 5);
-        msgpack_pack_str(mp_pck, 32);
-        msgpack_pack_str_body(mp_pck, out_chunk, 32);
+        msgpack_pack_str(mp_pck, chunk_len);
+        msgpack_pack_str_body(mp_pck, chunk, chunk_len);
     }
 
     /* "size": entries */
@@ -150,10 +165,9 @@ static int append_options(struct flb_forward *ctx,
         msgpack_pack_str_body(mp_pck, "gzip", 4);
     }
     else if (fc->compress == COMPRESS_GZIP &&
-             /* for metrics or traces, we're also able to send as
+             /* for non-log signals, we're also able to send as
               * gzipped payloads */
-             (event_type == FLB_EVENT_TYPE_METRICS ||
-              event_type == FLB_EVENT_TYPE_TRACES)) {
+             forward_event_type_is_non_log(event_type)) {
         flb_mp_map_header_append(&mh);
         msgpack_pack_str(mp_pck, 10);
         msgpack_pack_str_body(mp_pck, "compressed", 10);
@@ -161,7 +175,7 @@ static int append_options(struct flb_forward *ctx,
         msgpack_pack_str_body(mp_pck, "gzip", 4);
     }
 
-    /* event type (FLB_EVENT_TYPE_LOGS, FLB_EVENT_TYPE_METRICS, FLB_EVENT_TYPE_TRACES) */
+    /* event type (FLB_EVENT_TYPE_*) */
     flb_mp_map_header_append(&mh);
     msgpack_pack_str(mp_pck, 13);
     msgpack_pack_str_body(mp_pck, "fluent_signal", 13);
@@ -193,7 +207,7 @@ static int append_options(struct flb_forward *ctx,
 
     flb_plg_debug(ctx->ins,
                   "send options records=%d chunk='%s'",
-                  entries, out_chunk ? out_chunk : "NULL");
+                  entries, chunk ? chunk : "NULL");
     return 0;
 }
 
@@ -220,11 +234,9 @@ static int flb_forward_format_message_mode(struct flb_forward *ctx,
                                            void **out_buf, size_t *out_size)
 {
     int entries = 0;
-    size_t pre = 0;
-    size_t off = 0;
     size_t record_size;
     char *chunk;
-    char chunk_buf[33];
+    char chunk_buf[FLB_FORWARD_CHUNK_TOKEN_SIZE] = {0};
     msgpack_packer   mp_pck;
     msgpack_sbuffer  mp_sbuf;
     struct flb_time tm;
@@ -284,21 +296,20 @@ static int flb_forward_format_message_mode(struct flb_forward *ctx,
         /* Pack records */
         msgpack_pack_object(&mp_pck, *log_event.body);
 
-        record_size = off - pre;
+        record_size = log_decoder.record_length;
 
         if (ff) {
-            chunk = ff->checksum_hex;
+            chunk = ff->chunk_token;
         }
         else {
             chunk = chunk_buf;
         }
 
         append_options(ctx, fc, FLB_EVENT_TYPE_LOGS, &mp_pck, 0,
-                       (char *) data + pre, record_size,
+                       (void *) log_decoder.record_base, record_size,
                        log_event.metadata,
                        chunk);
 
-        pre = off;
         entries++;
     }
 
@@ -407,23 +418,23 @@ static int flb_forward_format_forward_mode(struct flb_forward *ctx,
     int result;
     int entries = 0;
     char *chunk;
-    char chunk_buf[33];
+    char chunk_buf[FLB_FORWARD_CHUNK_TOKEN_SIZE] = {0};
     msgpack_packer   mp_pck;
     msgpack_sbuffer  mp_sbuf;
-    char *transcoded_buffer;
-    size_t transcoded_length;
+    char *transcoded_buffer = NULL;
+    size_t transcoded_length = 0;
 
     msgpack_sbuffer_init(&mp_sbuf);
     msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
 
     if (ff) {
-        chunk = ff->checksum_hex;
+        chunk = ff->chunk_token;
     }
     else {
         chunk = chunk_buf;
     }
 
-    if (fc->send_options == FLB_TRUE || (event_type == FLB_EVENT_TYPE_METRICS || event_type == FLB_EVENT_TYPE_TRACES)) {
+    if (fc->send_options == FLB_TRUE || forward_event_type_is_non_log(event_type)) {
         if (event_type == FLB_EVENT_TYPE_LOGS) {
             entries = flb_mp_count(data, bytes);
         }
@@ -438,14 +449,18 @@ static int flb_forward_format_forward_mode(struct flb_forward *ctx,
                                                   &transcoded_buffer,
                                                   &transcoded_length);
 
-            if (result == 0) {
-                append_options(ctx, fc, event_type, &mp_pck, entries,
-                               transcoded_buffer,
-                               transcoded_length,
-                               NULL, chunk);
-
-                free(transcoded_buffer);
+            if (result != 0) {
+                msgpack_sbuffer_destroy(&mp_sbuf);
+                return -1;
             }
+
+            entries = flb_mp_count(transcoded_buffer, transcoded_length);
+            append_options(ctx, fc, event_type, &mp_pck, entries,
+                           transcoded_buffer,
+                           transcoded_length,
+                           NULL, chunk);
+
+            free(transcoded_buffer);
         }
         else {
             append_options(ctx, fc, event_type, &mp_pck, entries, (char *) data, bytes, NULL, chunk);
@@ -474,7 +489,7 @@ static int flb_forward_format_forward_compat_mode(struct flb_forward *ctx,
 {
     int entries = 0;
     char *chunk;
-    char chunk_buf[33];
+    char chunk_buf[FLB_FORWARD_CHUNK_TOKEN_SIZE] = {0};
     msgpack_packer   mp_pck;
     msgpack_sbuffer  mp_sbuf;
     struct flb_log_event_decoder log_decoder;
@@ -494,7 +509,7 @@ static int flb_forward_format_forward_compat_mode(struct flb_forward *ctx,
     msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
 
     if (ff) {
-        chunk = ff->checksum_hex;
+        chunk = ff->chunk_token;
     }
     else {
         chunk = chunk_buf;
@@ -507,7 +522,7 @@ static int flb_forward_format_forward_compat_mode(struct flb_forward *ctx,
                                   NULL, tag, tag_len);
 
     /* Entries */
-    entries = flb_mp_count(data, bytes);
+    entries = flb_mp_count_log_records(data, bytes);
     msgpack_pack_array(&mp_pck, entries);
 
     while ((ret = flb_log_event_decoder_next(
@@ -572,11 +587,7 @@ int flb_forward_format(struct flb_config *config,
         return -1;
     }
 
-    if (event_type == FLB_EVENT_TYPE_METRICS) {
-        mode = MODE_FORWARD;
-        goto do_formatting;
-    }
-    else if (event_type == FLB_EVENT_TYPE_TRACES) {
+    if (forward_event_type_is_non_log(event_type)) {
         mode = MODE_FORWARD;
         goto do_formatting;
     }

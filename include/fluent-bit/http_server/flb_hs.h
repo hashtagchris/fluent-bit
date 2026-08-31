@@ -22,31 +22,73 @@
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_config.h>
+#include <fluent-bit/flb_network.h>
+#include <fluent-bit/flb_pthread.h>
 #include <fluent-bit/flb_sds.h>
-#include <monkey/mk_lib.h>
+#include <fluent-bit/http_server/flb_http_server.h>
+#include <monkey/mk_core.h>
 
 /*
  * HTTP buffers that contains certain cached data to be used
  * by end-points.
  */
 struct flb_hs_buf {
+    pthread_mutex_t lock;
     int users;
+    int pending_free;
     flb_sds_t data;
     void *raw_data;
     size_t raw_size;
     struct mk_list _head;
 };
 
-struct flb_hs {
-    mk_ctx_t *ctx;             /* Monkey HTTP Context */
-    int vid;                   /* Virtual Host ID     */
-    int qid_metrics;           /* Metrics Message Queue ID    */
-    int qid_metrics_v2;        /* Metrics Message Queue ID for /api/v2 */
-    int qid_storage;           /* Storage Message Queue ID    */
-    int qid_health;            /* health Message Queue ID    */
+struct flb_health_check_metrics_counter {
+    int error_limit;
+    int error_counter;
+    int retry_failure_limit;
+    int retry_failure_counter;
+    int period_limit;
+    int period_counter;
+};
 
-    pthread_t tid;             /* Server Thread */
-    struct flb_config *config; /* Fluent Bit context */
+struct flb_hs_hc_buf {
+    int users;
+    int error_count;
+    int retry_failure_count;
+    struct mk_list _head;
+};
+
+enum flb_hs_route_match_type {
+    FLB_HS_ROUTE_EXACT = 0,
+    FLB_HS_ROUTE_PREFIX = 1
+};
+
+struct flb_hs;
+
+typedef int (*flb_hs_endpoint_callback)(
+                struct flb_hs *hs,
+                struct flb_http_request *request,
+                struct flb_http_response *response);
+
+struct flb_hs_route {
+    const char *path;
+    int match_type;
+    flb_hs_endpoint_callback callback;
+    struct mk_list _head;
+};
+
+struct flb_hs {
+    struct flb_http_server server;
+    struct flb_net_setup net_setup;
+    struct flb_config *config;
+    struct mk_list routes;
+    struct mk_list health_metrics;
+    pthread_mutex_t health_metrics_lock;
+    struct flb_health_check_metrics_counter health_counter;
+
+    struct flb_hs_buf metrics;
+    struct flb_hs_buf metrics_v2;
+    struct flb_hs_buf storage_metrics;
 
     /* end-point: root */
     size_t ep_root_size;
@@ -62,5 +104,13 @@ int flb_hs_push_storage_metrics(struct flb_hs *hs, void *data, size_t size);
 
 int flb_hs_destroy(struct flb_hs *ctx);
 int flb_hs_start(struct flb_hs *hs);
+void flb_hs_cmt_buffer_destroy(void *data);
+int flb_hs_buf_acquire(struct flb_hs_buf *buffer, int require_data,
+                       int require_raw_data);
+void flb_hs_buf_release(struct flb_hs_buf *buffer, void (*raw_free)(void *));
+int flb_hs_register_endpoint(struct flb_hs *hs,
+                             const char *path,
+                             int match_type,
+                             flb_hs_endpoint_callback callback);
 
 #endif

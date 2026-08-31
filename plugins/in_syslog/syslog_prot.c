@@ -44,7 +44,7 @@ static int append_message_to_record_data(char **result_buffer,
 {
     int                result = FLB_MAP_NOT_MODIFIED;
     char              *modified_data_buffer;
-    int                modified_data_size;
+    size_t             modified_data_size;
     msgpack_object_kv *new_map_entries[1];
     msgpack_object_kv  message_entry;
     *result_buffer = NULL;
@@ -240,7 +240,7 @@ int syslog_prot_process(struct syslog_conn *conn)
                 char *sp = p;
                 size_t n = 0;
                 while (sp < end && *sp >= '0' && *sp <= '9') {
-                    if (n > SIZE_MAX / 10) {
+                    if (n >= SIZE_MAX / 10) {
                         n = SIZE_MAX;
                         break;
                     }

@@ -28,18 +28,30 @@
 #include "fw_prot.h"
 #include "fw_conn.h"
 
+static void fw_conn_drop(struct flb_connection *connection);
+
 static int fw_conn_event_internal(struct flb_connection *connection)
 {
     int ret;
-    int bytes;
-    int available;
-    int size;
+    ssize_t bytes;
+    size_t read_bytes;
+    size_t available;
+    size_t size;
     char *tmp;
     struct fw_conn *conn;
     struct mk_event *event;
     struct flb_in_fw_config *ctx;
 
     conn = connection->user_data;
+
+    /*
+     * The wrapper may have already been released by the engine drop
+     * notification (e.g. a queued/injected event that fires after an IO
+     * timeout closed the connection). Nothing to do in that case.
+     */
+    if (conn == NULL) {
+        return 0;
+    }
 
     ctx = conn->ctx;
 
@@ -66,7 +78,7 @@ static int fw_conn_event_internal(struct flb_connection *connection)
         available = (conn->buf_size - conn->buf_len);
         if (available < 1) {
             if (conn->buf_size >= ctx->buffer_max_size) {
-                flb_plg_warn(ctx->ins, "fd=%i incoming data exceed limit (%lu bytes)",
+                flb_plg_warn(ctx->ins, "fd=%i incoming data exceed limit (%zu bytes)",
                              event->fd, (ctx->buffer_max_size));
                 fw_conn_del(conn);
                 return -1;
@@ -84,7 +96,7 @@ static int fw_conn_event_internal(struct flb_connection *connection)
                 flb_errno();
                 return -1;
             }
-            flb_plg_trace(ctx->ins, "fd=%i buffer realloc %i -> %i",
+            flb_plg_trace(ctx->ins, "fd=%i buffer realloc %zu -> %zu",
                           event->fd, conn->buf_size, size);
 
             conn->buf = tmp;
@@ -97,9 +109,10 @@ static int fw_conn_event_internal(struct flb_connection *connection)
                                 available);
 
         if (bytes > 0) {
-            flb_plg_trace(ctx->ins, "read()=%i pre_len=%i now_len=%i",
-                          bytes, conn->buf_len, conn->buf_len + bytes);
-            conn->buf_len += bytes;
+            read_bytes = (size_t) bytes;
+            flb_plg_trace(ctx->ins, "read()=%zd pre_len=%zu now_len=%zu",
+                          bytes, conn->buf_len, conn->buf_len + read_bytes);
+            conn->buf_len += read_bytes;
 
             ret = fw_prot_process(ctx->ins, conn);
             if (ret == -1) {
@@ -135,6 +148,14 @@ int fw_conn_event(void *data)
     connection = (struct flb_connection *) data;
 
     conn = connection->user_data;
+
+    /*
+     * The wrapper may have already been released by the engine drop
+     * notification (e.g. an injected event firing after an IO timeout).
+     */
+    if (conn == NULL) {
+        return 0;
+    }
 
     ctx = conn->ctx;
 
@@ -204,9 +225,7 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
     conn->helo       = helo;
 
     /* Set data for the event-loop */
-    connection->user_data     = conn;
-    connection->event.type    = FLB_ENGINE_EV_CUSTOM;
-    connection->event.handler = fw_conn_event;
+    connection->user_data = conn;
 
     /* Connection info */
     conn->ctx     = ctx;
@@ -230,12 +249,10 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
     conn->compression_type = FLB_COMPRESSION_ALGORITHM_NONE;
     conn->d_ctx = NULL;
 
-    /* Register instance into the event loop */
-    ret = mk_event_add(flb_engine_evl_get(),
-                       connection->fd,
-                       FLB_ENGINE_EV_CUSTOM,
-                       MK_EVENT_READ,
-                       &connection->event);
+    /* Run connection callbacks in a downstream-owned coroutine. */
+    ret = flb_downstream_conn_event_register(connection,
+                                             fw_conn_event,
+                                             MK_EVENT_READ);
     if (ret == -1) {
         flb_plg_error(ctx->ins, "could not register new connection");
         if (conn->helo != NULL) {
@@ -247,16 +264,26 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
     }
 
     mk_list_add(&conn->_head, &ctx->connections);
+
+    /*
+     * Install the drop notification callback only after all fallible setup
+     * has succeeded. If an earlier allocation or mk_event_add() fails, conn
+     * is freed and the caller releases the connection; installing the
+     * callback before that point would make prepare_destroy_conn() invoke
+     * fw_conn_drop() on the freed wrapper (use-after-free/double-free).
+     */
+    connection->drop_notification_callback = fw_conn_drop;
+
     return conn;
 }
 
-int fw_conn_del(struct fw_conn *conn)
+/*
+ * Free the plugin-side connection wrapper. This does NOT release the
+ * underlying downstream connection; the caller decides whether the engine
+ * (drop notification) or the plugin (fw_conn_del) owns that release.
+ */
+static void fw_conn_release(struct fw_conn *conn)
 {
-    /* The downstream unregisters the file descriptor from the event-loop
-     * so there's nothing to be done by the plugin
-     */
-    flb_downstream_conn_release(conn->connection);
-
     /* Release resources */
     mk_list_del(&conn->_head);
 
@@ -276,6 +303,57 @@ int fw_conn_del(struct fw_conn *conn)
     }
     flb_free(conn->buf);
     flb_free(conn);
+}
+
+/*
+ * Invoked by the engine (via prepare_destroy_conn) when the underlying
+ * connection is being destroyed out from under the plugin, e.g. on an IO
+ * timeout. Detach and free the wrapper here so it is never left in
+ * ctx->connections pointing at a freed connection, which would otherwise
+ * cause a use-after-free on the next fw_conn_del_all (shutdown/pause).
+ */
+static void fw_conn_drop(struct flb_connection *connection)
+{
+    struct fw_conn *conn;
+
+    if (connection == NULL) {
+        return;
+    }
+
+    conn = connection->user_data;
+
+    /* The engine owns the connection release from this point on */
+    connection->drop_notification_callback = NULL;
+    connection->user_data = NULL;
+
+    if (conn != NULL) {
+        flb_plg_trace(conn->ctx->ins, "drop connection fd=%i", connection->fd);
+        conn->connection = NULL;
+        fw_conn_release(conn);
+    }
+}
+
+int fw_conn_del(struct fw_conn *conn)
+{
+    int ret;
+    struct flb_connection *connection = conn->connection;
+
+    /*
+     * Downstream may need to wake a callback suspended in asynchronous I/O
+     * before releasing it. Keep the wrapper alive until that callback
+     * unwinds; the drop notification owns wrapper cleanup in both the
+     * immediate and deferred paths.
+     */
+    if (connection != NULL) {
+        ret = flb_downstream_conn_release(connection);
+        if (ret == FLB_DOWNSTREAM_CONN_DEFERRED) {
+            return 0;
+        }
+
+        return 0;
+    }
+
+    fw_conn_release(conn);
 
     return 0;
 }

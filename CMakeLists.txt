@@ -1,14 +1,16 @@
 cmake_minimum_required(VERSION 3.12)
 project(fluent-bit C)
 
+include(CheckCCompilerFlag)
+
 # CMP0069 ensures that LTO is enabled for all compilers
 cmake_policy(SET CMP0069 NEW)
 set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
 
 # Fluent Bit Version
 set(FLB_VERSION_MAJOR  5)
-set(FLB_VERSION_MINOR  0)
-set(FLB_VERSION_PATCH  0)
+set(FLB_VERSION_MINOR  1)
+set(FLB_VERSION_PATCH  1)
 set(FLB_VERSION_STR "${FLB_VERSION_MAJOR}.${FLB_VERSION_MINOR}.${FLB_VERSION_PATCH}")
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -207,7 +209,8 @@ option(FLB_SIGNV4              "Enable AWS Signv4 support"    Yes)
 option(FLB_AWS                 "Enable AWS support"           Yes)
 option(FLB_STATIC_CONF         "Build binary using static configuration")
 option(FLB_STREAM_PROCESSOR    "Enable Stream Processor"                    Yes)
-option(FLB_SIMD                "Enable SIMD support"                         No)
+set(FLB_SIMD "Auto" CACHE STRING "Enable SIMD support (On, Off, Auto)")
+set_property(CACHE FLB_SIMD PROPERTY STRINGS "On;Off;Auto")
 option(FLB_CORO_STACK_SIZE     "Set coroutine stack size")
 option(FLB_AVRO_ENCODER        "Build with Avro encoding support"            No)
 option(FLB_AWS_ERROR_REPORTER  "Build with aws error reporting support"      No)
@@ -258,7 +261,64 @@ option(FLB_EVENT_LOOP_SELECT    "Enable select(2) event loop backend" No)
 option(FLB_EVENT_LOOP_LIBEVENT  "Enable libevent event loop backend"  No)
 
 # SIMD support
-if(FLB_SIMD)
+# ------------
+# FLB_SIMD is a tri-state cache variable:
+#   Auto : enable SIMD only when the target architecture/toolchain is known-good
+#   On   : require SIMD support and fail during configure otherwise
+#   Off  : disable SIMD explicitly
+string(TOUPPER "${FLB_SIMD}" FLB_SIMD_MODE)
+
+if(FLB_SIMD_MODE MATCHES "^(ON|YES|TRUE|1)$")
+  set(FLB_SIMD_MODE "ON")
+elseif(FLB_SIMD_MODE MATCHES "^(OFF|NO|FALSE|0)$")
+  set(FLB_SIMD_MODE "OFF")
+elseif(NOT FLB_SIMD_MODE STREQUAL "AUTO")
+  message(FATAL_ERROR "FLB_SIMD must be one of: On, Off, Auto")
+endif()
+
+set(FLB_SIMD_ENABLED No)
+set(FLB_SIMD_RISCV_C_FLAGS "")
+
+if(NOT FLB_SIMD_MODE STREQUAL "OFF")
+  set(FLB_SIMD_SUPPORTED_ARCH No)
+
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND (CMAKE_SIZEOF_VOID_P GREATER 4))
+    set(FLB_SIMD_SUPPORTED_ARCH Yes)
+    set(FLB_SIMD_ENABLED Yes)
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
+    set(FLB_SIMD_SUPPORTED_ARCH Yes)
+    set(FLB_SIMD_ENABLED Yes)
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(riscv64)")
+    set(FLB_SIMD_SUPPORTED_ARCH Yes)
+    check_c_compiler_flag("-march=rv64gcv_zba" FLB_SIMD_RISCV_COMPILER_FLAG)
+
+    if(FLB_SIMD_RISCV_COMPILER_FLAG)
+      set(FLB_SIMD_ENABLED Yes)
+      set(FLB_SIMD_RISCV_C_FLAGS "-march=rv64gcv_zba")
+    elseif(FLB_SIMD_MODE STREQUAL "ON")
+      message(FATAL_ERROR
+        "FLB_SIMD=On requires compiler support for -march=rv64gcv_zba on riscv64")
+    else()
+      message(WARNING
+        "FLB_SIMD=Auto disabled SIMD on riscv64 because the compiler does not "
+        "support -march=rv64gcv_zba")
+    endif()
+  endif()
+
+  if(NOT FLB_SIMD_SUPPORTED_ARCH)
+    if(FLB_SIMD_MODE STREQUAL "ON")
+      message(FATAL_ERROR
+        "FLB_SIMD=On is only supported on x86_64, aarch64/arm64, and "
+        "riscv64 with RVV compiler support")
+    else()
+      message(STATUS
+        "FLB_SIMD=Auto disabled SIMD on unsupported architecture: "
+        "${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
+  endif()
+endif()
+
+if(FLB_SIMD_ENABLED)
   FLB_DEFINITION(FLB_HAVE_SIMD)
 endif()
 
@@ -314,6 +374,7 @@ if(FLB_ALL)
   # Output plugins
   set(FLB_OUT_ES          1)
   set(FLB_OUT_FORWARD     1)
+  set(FLB_OUT_GCS         1)
   set(FLB_OUT_GELF        1)
   set(FLB_OUT_HTTP        1)
   set(FLB_OUT_NATS        1)
@@ -663,16 +724,29 @@ endif()
 # ring buffer library
 add_subdirectory(${FLB_PATH_LIB_RING_BUFFER} EXCLUDE_FROM_ALL)
 
-# yyson
-add_subdirectory(${FLB_PATH_LIB_YYJSON} EXCLUDE_FROM_ALL)
+# yyjson
+option(FLB_YYJSON "Enable yyjson backend" ON)
+if(FLB_YYJSON)
+  add_subdirectory(${FLB_PATH_LIB_YYJSON} EXCLUDE_FROM_ALL)
+  FLB_DEFINITION(FLB_HAVE_YYJSON)
+
+  if (TARGET yyjson AND NOT FLB_COVERAGE AND
+      CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang|Intel")
+    # yyjson's O0 reader can exceed the default coroutine stack budget.
+    # Keep debug symbols, but force enough optimization to shrink the frame.
+    target_compile_options(yyjson PRIVATE
+      $<$<AND:$<COMPILE_LANGUAGE:C>,$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>>:-Og>
+    )
+  endif()
+endif()
 
 # Avro
 if(FLB_AVRO_ENCODER)
   # jansson
   option(JANSSON_BUILD_DOCS         OFF)
   option(JANSSON_EXAMPLES           OFF)
-  option(JANSSON_WITHOUT_TESTS       ON)
   option(JANSSON_BUILD_SHARED_LIBS  OFF)
+  set(JANSSON_WITHOUT_TESTS ON CACHE BOOL "" FORCE)
   add_subdirectory(${FLB_PATH_LIB_JANSSON})
 
   #avro
@@ -743,6 +817,7 @@ add_subdirectory(${FLB_PATH_LIB_JSMN})
 # Runtime Tests (filter_kubernetes) requires HTTP Server
 if(FLB_TESTS_RUNTIME)
   FLB_OPTION(FLB_HTTP_SERVER  ON)
+  FLB_OPTION(FLB_IN_EVENT_TEST ON)
 endif()
 
 # Monkey Core Library
@@ -776,6 +851,13 @@ elseif (FLB_EVENT_LOOP_LIBEVENT)
 else()
   FLB_DEFINITION(FLB_EVENT_LOOP_AUTO_DISCOVERY)
   message(STATUS "FLB Event loop backend > auto discovery (Monkey library)")
+endif()
+
+# Monkey uses its bundled libevent backend on Windows. Link it statically so
+# Fluent Bit binaries do not require event.dll at runtime.
+if(FLB_SYSTEM_WINDOWS)
+  set(EVENT__LIBRARY_TYPE STATIC CACHE STRING
+      "Build Monkey's bundled libevent as a static library" FORCE)
 endif()
 
 # Build Monkey HTTP Server
@@ -1380,8 +1462,8 @@ if(NOT FLB_POSIX_TLS)
   check_c_source_compiles("
    __thread int a;
    int main() {
-       __tls_get_addr(0);
-       return 0;
+       a = 1;
+       return a - 1;
    }" FLB_HAVE_C_TLS)
   if(FLB_HAVE_C_TLS)
     FLB_DEFINITION(FLB_HAVE_C_TLS)
@@ -1457,6 +1539,14 @@ else()
 endif()
 
 # Instruct CMake to build the Fluent Bit Core
+if(MSVC OR FLB_JEMALLOC)
+  # MSVC tests need plugin-private symbols that are not exported from fluent-bit.dll.
+  # Jemalloc must not be embedded in both the test executable and shared library.
+  set(FLB_TEST_LINK_LIBRARY fluent-bit-static)
+else()
+  set(FLB_TEST_LINK_LIBRARY fluent-bit-shared)
+endif()
+
 add_subdirectory(include)
 add_subdirectory(plugins)
 add_subdirectory(src)
@@ -1535,19 +1625,41 @@ if(DPKG_PROGRAM)
     ${PROJECT_SOURCE_DIR}/cpack/debian/conffiles
     )
 
+  set(LDCONFIG_POSTINST_CMDS "")
   if(FLB_RUN_LDCONFIG)
-    set(LDCONFIG_DIR ${FLB_INSTALL_LIBDIR})
-    file(WRITE ${PROJECT_BINARY_DIR}/scripts/postinst "
+    if(IS_ABSOLUTE "${FLB_INSTALL_LIBDIR}")
+      set(LDCONFIG_DIR "${FLB_INSTALL_LIBDIR}")
+    else()
+      set(LDCONFIG_DIR "/${FLB_INSTALL_LIBDIR}")
+    endif()
+    set(LDCONFIG_POSTINST_CMDS "
 mkdir -p /etc/ld.so.conf.d
 echo \"${LDCONFIG_DIR}\" > /etc/ld.so.conf.d/libfluent-bit.conf
 ldconfig
-    ")
-    file(WRITE ${PROJECT_BINARY_DIR}/scripts/prerm "
+")
+    file(WRITE ${PROJECT_BINARY_DIR}/scripts/prerm "#!/bin/sh
+set -e
 rm -f -- /etc/ld.so.conf.d/libfluent-bit.conf
 ldconfig
-    ")
-    set(CPACK_DEBIAN_RUNTIME_PACKAGE_CONTROL_EXTRA "${PROJECT_BINARY_DIR}/scripts/postinst;${PROJECT_BINARY_DIR}/scripts/prerm")
+")
+    execute_process(COMMAND chmod 0755 "${PROJECT_BINARY_DIR}/scripts/prerm"
+      RESULT_VARIABLE FLB_CHMOD_PRERM_RESULT)
+    if(NOT FLB_CHMOD_PRERM_RESULT EQUAL 0)
+      message(FATAL_ERROR "Failed to make ${PROJECT_BINARY_DIR}/scripts/prerm executable")
+    endif()
+    list(APPEND CPACK_DEBIAN_RUNTIME_PACKAGE_CONTROL_EXTRA "${PROJECT_BINARY_DIR}/scripts/prerm")
   endif(FLB_RUN_LDCONFIG)
+
+  configure_file(
+    ${PROJECT_SOURCE_DIR}/cpack/debian/postinst.in
+    ${PROJECT_BINARY_DIR}/scripts/postinst
+    @ONLY)
+  execute_process(COMMAND chmod 0755 "${PROJECT_BINARY_DIR}/scripts/postinst"
+    RESULT_VARIABLE FLB_CHMOD_POSTINST_RESULT)
+  if(NOT FLB_CHMOD_POSTINST_RESULT EQUAL 0)
+    message(FATAL_ERROR "Failed to make ${PROJECT_BINARY_DIR}/scripts/postinst executable")
+  endif()
+  list(APPEND CPACK_DEBIAN_RUNTIME_PACKAGE_CONTROL_EXTRA "${PROJECT_BINARY_DIR}/scripts/postinst")
 
 endif()
 

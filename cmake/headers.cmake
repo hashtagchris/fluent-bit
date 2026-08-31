@@ -7,6 +7,7 @@ if(NOT DEFINED FLB_PATH_ROOT_BINARY_DIR)
 endif()
 
 include_directories(
+  ${FLB_PATH_ROOT_BINARY_DIR}/generated/include
   ${FLB_PATH_ROOT_SOURCE}/include/
   ${FLB_PATH_ROOT_SOURCE}/lib/
 
@@ -35,7 +36,6 @@ include_directories(
   ${FLB_PATH_ROOT_SOURCE}/${FLB_PATH_LIB_CTRACES}/include
   ${FLB_PATH_ROOT_SOURCE}/${FLB_PATH_LIB_CPROFILES}/include
   ${FLB_PATH_ROOT_SOURCE}/${FLB_PATH_LIB_RING_BUFFER}/lwrb/src/include
-  ${FLB_PATH_ROOT_SOURCE}/${FLB_PATH_LIB_YYJSON}/src
   ${FLB_PATH_ROOT_BINARY_DIR}/${FLB_PATH_LIB_JANSSON}/include
   ${FLB_PATH_ROOT_BINARY_DIR}/lib/cmetrics
   ${FLB_PATH_ROOT_BINARY_DIR}/lib/cprofiles/include
@@ -44,6 +44,10 @@ include_directories(
   ${FLB_PATH_ROOT_BINARY_DIR}/lib/monkey/include/
   ${FLB_PATH_ROOT_BINARY_DIR}/lib/monkey/include/monkey/
   )
+
+if(FLB_YYJSON)
+  include_directories(${FLB_PATH_ROOT_SOURCE}/${FLB_PATH_LIB_YYJSON}/src)
+endif()
 
 if(FLB_UTF8_ENCODER)
   include_directories(${FLB_PATH_ROOT_SOURCE}/${FLB_PATH_LIB_TUTF8E}/include)

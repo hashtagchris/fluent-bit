@@ -94,7 +94,7 @@ struct cmt_summary *cmt_summary_create(struct cmt *cmt,
     if (quantiles_count > 0) {
         s->quantiles_count = quantiles_count;
         s->quantiles = calloc(1, sizeof(double) * quantiles_count);
-        if (!s->quantiles_count) {
+        if (!s->quantiles) {
             cmt_errno();
             cmt_summary_destroy(s);
             return NULL;
@@ -130,7 +130,8 @@ double cmt_summary_quantile_get_value(struct cmt_metric *metric, int quantile_id
 {
     uint64_t val;
 
-    if (quantile_id < 0 /*|| quantile_id > metric->sum_quantiles_count*/) {
+    if (metric == NULL || metric->sum_quantiles == NULL || quantile_id < 0 ||
+        (size_t) quantile_id >= metric->sum_quantiles_count) {
         return 0;
     }
 
@@ -220,6 +221,11 @@ void cmt_summary_quantile_set(struct cmt_metric *metric, uint64_t timestamp,
     double   new;
     int      result;
 
+    if (metric == NULL || metric->sum_quantiles == NULL || quantile_id < 0 ||
+        (size_t) quantile_id >= metric->sum_quantiles_count) {
+        return;
+    }
+
     do {
         old = cmt_summary_quantile_get_value(metric, quantile_id);
         new = val;
@@ -291,7 +297,7 @@ int cmt_summary_set_default(struct cmt_summary *summary,
     /* set quantile values */
     if (quantile_values) {
         /* yes, quantile values are set */
-        metric->sum_quantiles_set = CMT_TRUE;
+        cmt_atomic_store(&metric->sum_quantiles_set, CMT_TRUE);
 
         /* populate each quantile */
         for (i = 0; i < summary->quantiles_count; i++) {

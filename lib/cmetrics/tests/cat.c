@@ -22,7 +22,9 @@
 #include <cmetrics/cmt_gauge.h>
 #include <cmetrics/cmt_untyped.h>
 #include <cmetrics/cmt_histogram.h>
+#include <cmetrics/cmt_exp_histogram.h>
 #include <cmetrics/cmt_summary.h>
+#include <cmetrics/cmt_map.h>
 #include <cmetrics/cmt_encode_text.h>
 #include <cmetrics/cmt_encode_prometheus.h>
 #include <cmetrics/cmt_cat.h>
@@ -611,6 +613,179 @@ void test_histogram_populated_to_empty()
     cmt_destroy(cmt2);
 }
 
+void test_exp_histogram_preserves_aggregation_type()
+{
+    int ret;
+    uint64_t ts;
+    uint64_t positive_buckets[] = {1, 2};
+    struct cmt *src;
+    struct cmt *dst;
+    struct cmt_exp_histogram *src_histogram;
+    struct cmt_exp_histogram *dst_histogram;
+
+    src = cmt_create();
+    TEST_CHECK(src != NULL);
+
+    dst = cmt_create();
+    TEST_CHECK(dst != NULL);
+
+    src_histogram = cmt_exp_histogram_create(src,
+                                             "test", "exp", "aggregation_type",
+                                             "Exponential histogram aggregation type test",
+                                             1, (char *[]) {"label"});
+    TEST_CHECK(src_histogram != NULL);
+
+    ts = cfl_time_now();
+
+    ret = cmt_exp_histogram_set_default(src_histogram,
+                                        ts,
+                                        1,
+                                        0,
+                                        0.0,
+                                        0,
+                                        2,
+                                        positive_buckets,
+                                        0,
+                                        0,
+                                        NULL,
+                                        CMT_TRUE,
+                                        3.0,
+                                        3,
+                                        1,
+                                        (char *[]) {"value"});
+    TEST_CHECK(ret == 0);
+
+    src_histogram->aggregation_type = CMT_AGGREGATION_TYPE_DELTA;
+
+    ret = cmt_cat(dst, src);
+    TEST_CHECK(ret == 0);
+
+    dst_histogram = cfl_list_entry_first(&dst->exp_histograms,
+                                         struct cmt_exp_histogram, _head);
+    TEST_CHECK(dst_histogram != NULL);
+    TEST_CHECK(dst_histogram->aggregation_type == CMT_AGGREGATION_TYPE_DELTA);
+
+    cmt_destroy(src);
+    cmt_destroy(dst);
+}
+
+void test_summary_concatenation_preserves_series()
+{
+    int                   ret;
+    int                   found_first;
+    int                   found_second;
+    double                quantiles[] = {0.5, 0.9};
+    double                values[] = {5.0, 9.0};
+    struct cfl_list      *head;
+    struct cfl_list      *label_head;
+    struct cmt           *dst;
+    struct cmt           *src_first;
+    struct cmt           *src_second;
+    struct cmt_summary   *summary;
+    struct cmt_metric    *metric;
+    struct cmt_map_label *label;
+
+    dst = cmt_create();
+    src_first = cmt_create();
+    src_second = cmt_create();
+    TEST_ASSERT(dst != NULL);
+    TEST_ASSERT(src_first != NULL);
+    TEST_ASSERT(src_second != NULL);
+
+    summary = cmt_summary_create(src_first, "test", "cat", "summary",
+                                 "Summary concatenation", 2, quantiles,
+                                 1, (char *[]) {"kind"});
+    TEST_ASSERT(summary != NULL);
+    ret = cmt_summary_set_default(summary, 10, values, 14.0, 7,
+                                  1, (char *[]) {"first"});
+    TEST_ASSERT(ret == 0);
+
+    ret = cmt_cat(dst, src_first);
+    TEST_ASSERT(ret == 0);
+    TEST_CHECK(cfl_list_size(&dst->summaries) == 1);
+
+    summary = cfl_list_entry_first(&dst->summaries,
+                                   struct cmt_summary, _head);
+    TEST_CHECK(cfl_list_size(&summary->map->metrics) == 1);
+
+    metric = cfl_list_entry_first(&summary->map->metrics,
+                                  struct cmt_metric, _head);
+    label = cfl_list_entry_first(&metric->labels,
+                                 struct cmt_map_label, _head);
+    TEST_CHECK(strcmp(label->name, "first") == 0);
+    TEST_CHECK(cmt_summary_get_count_value(metric) == 7);
+
+    summary = cmt_summary_create(src_second, "test", "cat", "summary",
+                                 "Summary concatenation", 2, quantiles,
+                                 1, (char *[]) {"kind"});
+    TEST_ASSERT(summary != NULL);
+    ret = cmt_summary_set_default(summary, 20, values, 18.0, 9,
+                                  1, (char *[]) {"second"});
+    TEST_ASSERT(ret == 0);
+
+    ret = cmt_cat(dst, src_second);
+    TEST_ASSERT(ret == 0);
+    TEST_CHECK(cfl_list_size(&dst->summaries) == 1);
+
+    summary = cfl_list_entry_first(&dst->summaries,
+                                   struct cmt_summary, _head);
+    TEST_CHECK(cfl_list_size(&summary->map->metrics) == 2);
+
+    found_first = CMT_FALSE;
+    found_second = CMT_FALSE;
+    cfl_list_foreach(head, &summary->map->metrics) {
+        metric = cfl_list_entry(head, struct cmt_metric, _head);
+        label_head = metric->labels.next;
+        label = cfl_list_entry(label_head, struct cmt_map_label, _head);
+
+        TEST_CHECK(strcmp(label->name, "kind") != 0);
+        if (strcmp(label->name, "first") == 0) {
+            found_first = CMT_TRUE;
+        }
+        else if (strcmp(label->name, "second") == 0) {
+            found_second = CMT_TRUE;
+        }
+    }
+
+    TEST_CHECK(found_first == CMT_TRUE);
+    TEST_CHECK(found_second == CMT_TRUE);
+
+    cmt_destroy(src_second);
+    cmt_destroy(src_first);
+    cmt_destroy(dst);
+}
+
+void test_summary_concatenation_rejects_mismatched_label_schema()
+{
+    int ret;
+    double quantiles[] = {0.5, 0.9};
+    struct cmt *dst;
+    struct cmt *src;
+    struct cmt_summary *summary;
+
+    dst = cmt_create();
+    src = cmt_create();
+    TEST_ASSERT(dst != NULL);
+    TEST_ASSERT(src != NULL);
+
+    summary = cmt_summary_create(dst, "test", "cat", "schema",
+                                 "schema validation", 2, quantiles, 2,
+                                 (char *[]) {"method", "status"});
+    TEST_ASSERT(summary != NULL);
+
+    summary = cmt_summary_create(src, "test", "cat", "schema",
+                                 "schema validation", 2, quantiles, 2,
+                                 (char *[]) {"status", "method"});
+    TEST_ASSERT(summary != NULL);
+
+    ret = cmt_cat(dst, src);
+    TEST_CHECK(ret == -1);
+    TEST_CHECK(cfl_list_size(&dst->summaries) == 1);
+
+    cmt_destroy(src);
+    cmt_destroy(dst);
+}
+
 TEST_LIST = {
     {"cat", test_cat},
     {"duplicate_metrics", test_duplicate_metrics},
@@ -618,5 +793,9 @@ TEST_LIST = {
     {"histogram_mismatched_buckets", test_histogram_mismatched_buckets},
     {"histogram_empty_to_populated", test_histogram_empty_to_populated},
     {"histogram_populated_to_empty", test_histogram_populated_to_empty},
+    {"exp_histogram_preserves_aggregation_type", test_exp_histogram_preserves_aggregation_type},
+    {"summary_concatenation_preserves_series", test_summary_concatenation_preserves_series},
+    {"summary_concatenation_rejects_mismatched_label_schema",
+     test_summary_concatenation_rejects_mismatched_label_schema},
     { 0 }
 };

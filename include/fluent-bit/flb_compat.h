@@ -27,6 +27,8 @@
 #ifndef FLB_COMPAT_H
 #define FLB_COMPAT_H
 
+#include <string.h>
+
 /*
  * libmonkey exposes compat macros for <unistd.h>, which some platforms lack,
  * so include the header here.
@@ -109,7 +111,7 @@ static inline char* basename(const char *path)
     char dir[_MAX_DIR];
     char fname[_MAX_FNAME];
     char ext[_MAX_EXT];
-    static char buf[_MAX_PATH];
+    static __declspec(thread) char buf[_MAX_PATH];
 
     _splitpath_s(path, drive, _MAX_DRIVE, dir, _MAX_DIR,
                        fname, _MAX_FNAME, ext, _MAX_EXT);
@@ -204,8 +206,14 @@ static inline uint32_t __attribute__((optimize("-O0"))) FLB_ALIGNED_DWORD_READ(u
 #endif
 
 #else
-static inline uint32_t FLB_ALIGNED_DWORD_READ(unsigned char *source) {
-    return *((uint32_t *) source);
+static inline uint32_t FLB_ALIGNED_DWORD_READ(unsigned char *source)
+{
+    uint32_t result;
+
+    /* MessagePack extension payloads are not guaranteed to be aligned. */
+    memcpy(&result, source, sizeof(result));
+
+    return result;
 }
 #endif
 

@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include "flb_tests_runtime.h"
 
+#define DPATH            FLB_TESTS_DATA_PATH "/data/common"
 #define DEFAULT_IO_TIMEOUT 10
 #define DEFAULT_HOST       "127.0.0.1"
 #define DEFAULT_PORT       5170
@@ -68,6 +69,35 @@ static void clear_output_num()
     set_output_num(0);
 }
 
+struct test_log_verifier {
+    const char *expected;
+    size_t expected_len;
+    int records;
+    int valid_matches;
+};
+
+static void reset_log_verifier(struct test_log_verifier *verifier,
+                               const char *expected,
+                               size_t expected_len)
+{
+    pthread_mutex_lock(&result_mutex);
+    verifier->expected = expected;
+    verifier->expected_len = expected_len;
+    verifier->records = 0;
+    verifier->valid_matches = 0;
+    pthread_mutex_unlock(&result_mutex);
+}
+
+static void get_log_verifier(struct test_log_verifier *verifier,
+                             int *records,
+                             int *valid_matches)
+{
+    pthread_mutex_lock(&result_mutex);
+    *records = verifier->records;
+    *valid_matches = verifier->valid_matches;
+    pthread_mutex_unlock(&result_mutex);
+}
+
 static int cb_count_msgpack(void *record, size_t size, void *data)
 {
     msgpack_unpacked result;
@@ -75,6 +105,17 @@ static int cb_count_msgpack(void *record, size_t size, void *data)
 
     if (!TEST_CHECK(data != NULL)) {
         flb_error("data is NULL");
+    }
+
+    if (!TEST_CHECK(record != NULL)) {
+        flb_error("record is NULL");
+        return -1;
+    }
+
+    if (!TEST_CHECK(size > 0)) {
+        flb_error("record size is zero");
+        flb_free(record);
+        return -1;
     }
 
     /* Iterate each item array and apply rules */
@@ -87,6 +128,91 @@ static int cb_count_msgpack(void *record, size_t size, void *data)
     msgpack_unpacked_destroy(&result);
 
     flb_free(record);
+    return 0;
+}
+
+static int cb_check_large_record_msgpack(void *record, size_t size, void *data)
+{
+    msgpack_unpacked result;
+    msgpack_object root;
+    msgpack_object *map;
+    msgpack_object_kv *kv;
+    size_t off = 0;
+    int i;
+    struct test_log_verifier *verifier = data;
+
+    if (!TEST_CHECK(verifier != NULL)) {
+        flb_error("verifier is NULL");
+        if (record != NULL) {
+            flb_free(record);
+        }
+        return -1;
+    }
+
+    if (!TEST_CHECK(record != NULL)) {
+        flb_error("record is NULL");
+        return -1;
+    }
+
+    if (!TEST_CHECK(size > 0)) {
+        flb_error("record size is zero");
+        flb_free(record);
+        return -1;
+    }
+
+    msgpack_unpacked_init(&result);
+
+    while (msgpack_unpack_next(&result, record, size, &off) == MSGPACK_UNPACK_SUCCESS) {
+        root = result.data;
+        map = NULL;
+
+        if (root.type == MSGPACK_OBJECT_ARRAY && root.via.array.size == 2) {
+            if (root.via.array.ptr[1].type == MSGPACK_OBJECT_MAP) {
+                map = &root.via.array.ptr[1];
+            }
+        }
+        else if (root.type == MSGPACK_OBJECT_MAP) {
+            map = &root;
+        }
+
+        pthread_mutex_lock(&result_mutex);
+        verifier->records++;
+        pthread_mutex_unlock(&result_mutex);
+
+        if (map == NULL) {
+            continue;
+        }
+
+        for (i = 0; i < map->via.map.size; i++) {
+            kv = &map->via.map.ptr[i];
+
+            if (kv->key.type != MSGPACK_OBJECT_STR) {
+                continue;
+            }
+
+            if (kv->key.via.str.size != 3 ||
+                strncmp(kv->key.via.str.ptr, "log", 3) != 0) {
+                continue;
+            }
+
+            if (kv->val.type != MSGPACK_OBJECT_STR) {
+                continue;
+            }
+
+            if (kv->val.via.str.size == verifier->expected_len &&
+                memcmp(kv->val.via.str.ptr,
+                       verifier->expected,
+                       verifier->expected_len) == 0) {
+                pthread_mutex_lock(&result_mutex);
+                verifier->valid_matches++;
+                pthread_mutex_unlock(&result_mutex);
+            }
+        }
+    }
+
+    msgpack_unpacked_destroy(&result);
+    flb_free(record);
+
     return 0;
 }
 
@@ -138,6 +264,7 @@ static struct test_ctx *test_ctx_create(struct flb_lib_out_cb *data)
                     "Flush", "0.200000000",
                     "Grace", "1",
                     "Log_Level", "error",
+                    "Parsers_File", DPATH "/parsers.conf",
                     NULL);
 
     /* Input */
@@ -547,6 +674,107 @@ void flb_test_format_none_separator()
     test_ctx_destroy(ctx);
 }
 
+#ifdef FLB_HAVE_PARSER
+void flb_test_format_none_with_parser()
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_ctx *ctx;
+    flb_sockfd_t fd;
+    int ret;
+    int num;
+    ssize_t w_size;
+    char *buf = "{\"test\":\"msg\"}\n";
+    size_t size = strlen(buf);
+
+    clear_output_num();
+
+    cb_data.cb = cb_check_result_json;
+    cb_data.data = "\"test\":\"msg\"";
+
+    ctx = test_ctx_create(&cb_data);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "*",
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd,
+                        "format", "none",
+                        "parser", "json",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    fd = connect_tcp(NULL, -1);
+    if (!TEST_CHECK(fd >= 0)) {
+        exit(EXIT_FAILURE);
+    }
+
+    w_size = send(fd, buf, size, 0);
+    if (!TEST_CHECK(w_size == size)) {
+        TEST_MSG("failed to send, errno=%d", errno);
+        flb_socket_close(fd);
+        exit(EXIT_FAILURE);
+    }
+
+    flb_time_msleep(1500);
+
+    num = get_output_num();
+    if (!TEST_CHECK(num > 0)) {
+        TEST_MSG("no outputs");
+    }
+
+    flb_socket_close(fd);
+    test_ctx_destroy(ctx);
+}
+
+void flb_test_format_none_with_unknown_parser()
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_ctx *ctx;
+    int ret;
+
+    clear_output_num();
+
+    cb_data.cb = cb_check_result_json;
+    cb_data.data = "\"test\":\"msg\"";
+
+    ctx = test_ctx_create(&cb_data);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "*",
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd,
+                        "format", "none",
+                        "parser", "nonexistent_parser",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    if (!TEST_CHECK(ret != 0)) {
+        TEST_MSG("flb_start unexpectedly succeeded with unknown parser");
+    }
+
+    /* flb_start failed, so there is no running engine to stop. */
+    flb_destroy(ctx->flb);
+    flb_free(ctx);
+}
+#endif
+
 /*
  * Ingest 64k records.
  * https://github.com/fluent/fluent-bit/issues/5336
@@ -613,13 +841,114 @@ void flb_test_issue_5336()
     test_ctx_destroy(ctx);
 }
 
+
+void flb_test_format_none_large_record()
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_ctx *ctx;
+    flb_sockfd_t fd;
+    int ret;
+    int records;
+    int valid_matches;
+    ssize_t w_size;
+    struct test_log_verifier verifier;
+    size_t payload_size = 131072;
+    char *buf;
+
+    clear_output_num();
+
+    buf = flb_malloc(payload_size + 3);
+    if (!TEST_CHECK(buf != NULL)) {
+        TEST_MSG("failed to allocate test payload");
+        exit(EXIT_FAILURE);
+    }
+
+    memset(buf, 'a', payload_size);
+    buf[payload_size] = ':';
+    buf[payload_size + 1] = ';';
+    buf[payload_size + 2] = '\0';
+
+    reset_log_verifier(&verifier, buf, payload_size + 1);
+
+    cb_data.cb = cb_check_large_record_msgpack;
+    cb_data.data = &verifier;
+
+    ctx = test_ctx_create(&cb_data);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        flb_free(buf);
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "*",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd,
+                        "format", "none",
+                        "separator", ";",
+                        "chunk_size", "64KB",
+                        "buffer_size", "256KB",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    fd = connect_tcp(NULL, -1);
+    if (!TEST_CHECK(fd >= 0)) {
+        flb_free(buf);
+        exit(EXIT_FAILURE);
+    }
+
+    w_size = 0;
+    while ((size_t) w_size < payload_size + 2) {
+        ret = send(fd,
+                   buf + w_size,
+                   (payload_size + 2) - (size_t) w_size,
+                   0);
+
+        if (!TEST_CHECK(ret > 0)) {
+            TEST_MSG("failed to send large payload, errno=%d", errno);
+            flb_socket_close(fd);
+            flb_free(buf);
+            exit(EXIT_FAILURE);
+        }
+
+        w_size += ret;
+    }
+
+    TEST_CHECK(w_size == (ssize_t) (payload_size + 2));
+
+    flb_time_msleep(1500);
+
+    get_log_verifier(&verifier, &records, &valid_matches);
+
+    if (!TEST_CHECK(records == 1)) {
+        TEST_MSG("got %d outputs, expected 1", records);
+    }
+
+    if (!TEST_CHECK(valid_matches == 1)) {
+        TEST_MSG("matched payload count=%d, expected 1", valid_matches);
+    }
+
+    flb_socket_close(fd);
+    test_ctx_destroy(ctx);
+    flb_free(buf);
+}
+
 TEST_LIST = {
     {"tcp", flb_test_tcp},
     {"tcp_with_source_address", flb_test_tcp_with_source_address},
     {"tcp_with_tls", flb_test_tcp_with_tls},
     {"format_none", flb_test_format_none},
     {"format_none_separator", flb_test_format_none_separator},
+#ifdef FLB_HAVE_PARSER
+    {"format_none_with_parser", flb_test_format_none_with_parser},
+    {"format_none_with_unknown_parser", flb_test_format_none_with_unknown_parser},
+#endif
+    {"format_none_large_record", flb_test_format_none_large_record},
     {"65535_records_issue_5336", flb_test_issue_5336},
     {NULL, NULL}
 };
-

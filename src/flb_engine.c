@@ -18,8 +18,10 @@
  */
 
 #include <math.h>
+#include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <monkey/mk_core.h>
 #include <fluent-bit/flb_bucket_queue.h>
@@ -33,11 +35,13 @@
 #include <fluent-bit/flb_pipe.h>
 #include <fluent-bit/flb_custom.h>
 #include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_input_chunk.h>
 #include <fluent-bit/flb_output.h>
 #include <fluent-bit/flb_error.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_engine.h>
+#include <fluent-bit/flb_fips.h>
 #include <fluent-bit/flb_event.h>
 #include <fluent-bit/flb_engine_dispatch.h>
 #include <fluent-bit/flb_network.h>
@@ -76,6 +80,24 @@ extern struct flb_aws_error_reporter *error_reporter;
 
 static pthread_once_t local_thread_engine_evl_init = PTHREAD_ONCE_INIT;
 FLB_TLS_DEFINE(struct mk_event_loop, flb_engine_evl);
+
+static int engine_has_fluentbit_logs_input(struct flb_config *config)
+{
+    struct mk_list *head;
+    struct flb_input_instance *ins;
+
+    mk_list_foreach(head, &config->inputs) {
+        ins = mk_list_entry(head, struct flb_input_instance, _head);
+
+        if (ins->p != NULL &&
+            ins->p->name != NULL &&
+            strcmp(ins->p->name, "fluentbit_logs") == 0) {
+            return FLB_TRUE;
+        }
+    }
+
+    return FLB_FALSE;
+}
 
 static void flb_engine_evl_init_private()
 {
@@ -232,6 +254,247 @@ static inline double calculate_chunk_capacity_percent(struct flb_output_instance
                   ((double)ins->total_limit_size));
 }
 
+static inline double adaptive_flush_clamp(double value, double min, double max)
+{
+    if (value < min) {
+        return min;
+    }
+
+    if (value > max) {
+        return max;
+    }
+
+    return value;
+}
+
+static double flb_engine_get_chunk_backpressure_percent(struct flb_config *config)
+{
+    double pressure;
+    double max_pressure;
+    struct mk_list *head;
+    struct flb_output_instance *ins;
+
+    max_pressure = 0.0;
+
+    mk_list_foreach(head, &config->outputs) {
+        ins = mk_list_entry(head, struct flb_output_instance, _head);
+
+        if (ins->total_limit_size <= 0) {
+            continue;
+        }
+
+        pressure = ((double) (ins->fs_backlog_chunks_size + ins->fs_chunks_size) * 100.0)
+                   / ((double) ins->total_limit_size);
+
+        pressure = adaptive_flush_clamp(pressure, 0.0, 100.0);
+
+        if (pressure > max_pressure) {
+            max_pressure = pressure;
+        }
+    }
+
+    return max_pressure;
+}
+
+static int flb_engine_flush_timer_reset(struct flb_config *config, double interval)
+{
+    struct mk_event *event;
+    struct flb_time t_flush;
+    double fallback_interval;
+
+    event = &config->event_flush;
+    fallback_interval = config->flush_adaptive_current_interval;
+
+    if (event->status != MK_EVENT_NONE) {
+        mk_event_timeout_destroy(config->evl, event);
+    }
+
+    flb_time_from_double(&t_flush, interval);
+
+    config->flush_fd = mk_event_timeout_create(config->evl,
+                                               t_flush.tm.tv_sec,
+                                               t_flush.tm.tv_nsec,
+                                               event);
+    event->priority = FLB_ENGINE_PRIORITY_FLUSH;
+
+    if (config->flush_fd == -1) {
+        flb_utils_error(FLB_ERR_CFG_FLUSH_CREATE);
+
+        if (fallback_interval > 0.0 &&
+            fabs(fallback_interval - interval) > DBL_EPSILON) {
+            flb_time_from_double(&t_flush, fallback_interval);
+            config->flush_fd = mk_event_timeout_create(config->evl,
+                                                       t_flush.tm.tv_sec,
+                                                       t_flush.tm.tv_nsec,
+                                                       event);
+            event->priority = FLB_ENGINE_PRIORITY_FLUSH;
+        }
+
+        if (config->flush_fd == -1) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+int flb_engine_adaptive_flush_target_level(struct flb_config *config,
+                                           double pressure)
+{
+    if (pressure >= config->flush_adaptive_high_pressure) {
+        return 3;
+    }
+    else if (pressure >= config->flush_adaptive_medium_pressure) {
+        return 2;
+    }
+    else if (pressure <= config->flush_adaptive_low_pressure) {
+        return 0;
+    }
+
+    return 1;
+}
+
+double flb_engine_adaptive_flush_interval(struct flb_config *config,
+                                          int level)
+{
+    double interval;
+    static const double multipliers[] = {2.0, 1.0, 0.75, 0.5};
+
+    if (level < 0) {
+        level = 0;
+    }
+    else if (level > 3) {
+        level = 3;
+    }
+
+    interval = config->flush * multipliers[level];
+
+    return adaptive_flush_clamp(interval,
+                                config->flush_adaptive_min_interval,
+                                config->flush_adaptive_max_interval);
+}
+
+static void flb_engine_adaptive_flush_update(struct flb_config *config)
+{
+    int target_level;
+    double pressure;
+    double interval;
+
+    if (config->flush_adaptive == FLB_FALSE) {
+        return;
+    }
+
+    pressure = flb_engine_get_chunk_backpressure_percent(config);
+
+    target_level = flb_engine_adaptive_flush_target_level(config, pressure);
+
+    if (target_level > config->flush_adaptive_level) {
+        if (config->flush_adaptive_direction != 1) {
+            config->flush_adaptive_direction = 1;
+            config->flush_adaptive_hits = 0;
+        }
+
+        config->flush_adaptive_hits++;
+
+        if (config->flush_adaptive_hits >= config->flush_adaptive_up_steps) {
+            config->flush_adaptive_level++;
+            config->flush_adaptive_hits = 0;
+        }
+    }
+    else if (target_level < config->flush_adaptive_level) {
+        if (config->flush_adaptive_direction != -1) {
+            config->flush_adaptive_direction = -1;
+            config->flush_adaptive_hits = 0;
+        }
+
+        config->flush_adaptive_hits++;
+
+        if (config->flush_adaptive_hits >= config->flush_adaptive_down_steps) {
+            config->flush_adaptive_level--;
+            config->flush_adaptive_hits = 0;
+        }
+    }
+    else {
+        config->flush_adaptive_direction = 0;
+        config->flush_adaptive_hits = 0;
+    }
+
+    if (config->flush_adaptive_level < 0) {
+        config->flush_adaptive_level = 0;
+    }
+    else if (config->flush_adaptive_level > 3) {
+        config->flush_adaptive_level = 3;
+    }
+
+    interval = flb_engine_adaptive_flush_interval(config,
+                                                  config->flush_adaptive_level);
+
+    if (fabs(interval - config->flush_adaptive_current_interval)
+        <= (DBL_EPSILON * fmax(fabs(interval),
+                               fabs(config->flush_adaptive_current_interval)))) {
+        return;
+    }
+
+    if (flb_engine_flush_timer_reset(config, interval) == 0) {
+        config->flush_adaptive_current_interval = interval;
+        flb_debug("[engine] adaptive flush interval %.3f sec (pressure=%.2f%%, level=%i)",
+                  interval,
+                  pressure,
+                  config->flush_adaptive_level);
+    }
+}
+
+static void flb_engine_adaptive_flush_init(struct flb_config *config)
+{
+    if (config->flush_adaptive == FLB_FALSE) {
+        config->flush_adaptive_current_interval = config->flush;
+        return;
+    }
+
+    if (config->flush_adaptive_min_interval <= 0.0) {
+        config->flush_adaptive_min_interval = 0.1;
+    }
+
+    if (config->flush_adaptive_max_interval <
+        config->flush_adaptive_min_interval) {
+        config->flush_adaptive_max_interval =
+            config->flush_adaptive_min_interval;
+    }
+
+    if (config->flush_adaptive_up_steps < 1) {
+        config->flush_adaptive_up_steps = 1;
+    }
+
+    if (config->flush_adaptive_down_steps < 1) {
+        config->flush_adaptive_down_steps = 1;
+    }
+
+    if (config->flush_adaptive_low_pressure < 0.0) {
+        config->flush_adaptive_low_pressure = 0.0;
+    }
+
+    if (config->flush_adaptive_high_pressure > 100.0) {
+        config->flush_adaptive_high_pressure = 100.0;
+    }
+
+    if (config->flush_adaptive_low_pressure >
+        config->flush_adaptive_medium_pressure) {
+        config->flush_adaptive_medium_pressure =
+            config->flush_adaptive_low_pressure;
+    }
+
+    if (config->flush_adaptive_medium_pressure >
+        config->flush_adaptive_high_pressure) {
+        config->flush_adaptive_medium_pressure =
+            config->flush_adaptive_high_pressure;
+    }
+
+    config->flush_adaptive_current_interval =
+        flb_engine_adaptive_flush_interval(config,
+                                           config->flush_adaptive_level);
+
+}
+
 static void handle_dlq_if_available(struct flb_config *config,
                                     struct flb_task *task,
                                     struct flb_output_instance *ins,
@@ -286,11 +549,13 @@ static inline int handle_output_event(uint64_t ts,
     int ret;
     int task_id;
     int out_id;
+    int effective_records = 0;
     int retries;
     int retry_seconds;
     uint32_t type;
     uint32_t key;
     double latency_seconds;
+    size_t effective_bytes = 0;
     char *in_name;
     char *out_name;
     struct flb_task *task;
@@ -340,6 +605,14 @@ static inline int handle_output_event(uint64_t ts,
     }
     in_name = (char *) flb_input_name(task->i_ins);
     out_name = (char *) flb_output_name(ins);
+    flb_task_acquire_lock(task);
+    if (flb_task_get_route_data(task, ins,
+                                &effective_records,
+                                &effective_bytes) != 0) {
+        effective_records = task->event_chunk->total_events;
+        effective_bytes = task->event_chunk->size;
+    }
+    flb_task_release_lock(task);
 
     /* If we are in synchronous mode, flush the next waiting task */
     if (ins->flags & FLB_OUTPUT_SYNCHRONOUS) {
@@ -351,19 +624,19 @@ static inline int handle_output_event(uint64_t ts,
     /* A task has finished, delete it */
     if (ret == FLB_OK) {
         /* cmetrics */
-        cmt_counter_add(ins->cmt_proc_records, ts, task->event_chunk->total_events,
+        cmt_counter_add(ins->cmt_proc_records, ts, effective_records,
                         1, (char *[]) {out_name});
 
-        cmt_counter_add(ins->cmt_proc_bytes, ts, task->event_chunk->size,
+        cmt_counter_add(ins->cmt_proc_bytes, ts, effective_bytes,
                         1, (char *[]) {out_name});
 
         if (config->router && task->event_chunk->type == FLB_EVENT_TYPE_LOGS) {
             cmt_counter_add(config->router->logs_records_total, ts,
-                            task->event_chunk->total_events,
+                            effective_records,
                             2, (char *[]) {in_name, out_name});
 
             cmt_counter_add(config->router->logs_bytes_total, ts,
-                            task->event_chunk->size,
+                            effective_bytes,
                             2, (char *[]) {in_name, out_name});
         }
 
@@ -378,9 +651,9 @@ static inline int handle_output_event(uint64_t ts,
 #ifdef FLB_HAVE_METRICS
         if (ins->metrics) {
             flb_metrics_sum(FLB_METRIC_OUT_OK_RECORDS,
-                            task->event_chunk->total_events, ins->metrics);
+                            effective_records, ins->metrics);
             flb_metrics_sum(FLB_METRIC_OUT_OK_BYTES,
-                            task->event_chunk->size, ins->metrics);
+                            effective_bytes, ins->metrics);
         }
 #endif
         /* Inform the user if a 'retry' succedeed */
@@ -404,6 +677,8 @@ static inline int handle_output_event(uint64_t ts,
                      flb_output_name(ins), out_id);
         }
 
+        flb_input_chunk_release_route(task->ic, ins);
+
         cmt_gauge_set(ins->cmt_chunk_available_capacity_percent, ts,
                       calculate_chunk_capacity_percent(ins),
                       1, (char *[]) {out_name});
@@ -416,17 +691,17 @@ static inline int handle_output_event(uint64_t ts,
             handle_dlq_if_available(config, task, ins, 0);
 
             /* cmetrics: output_dropped_records_total */
-            cmt_counter_add(ins->cmt_dropped_records, ts, task->records,
+            cmt_counter_add(ins->cmt_dropped_records, ts, effective_records,
                             1, (char *[]) {out_name});
 
             if (config->router && task->event_chunk &&
                 task->event_chunk->type == FLB_EVENT_TYPE_LOGS) {
                 cmt_counter_add(config->router->logs_drop_records_total, ts,
-                                task->records,
+                                effective_records,
                                 2, (char *[]) {in_name, out_name});
 
                 cmt_counter_add(config->router->logs_drop_bytes_total, ts,
-                                task->event_chunk->size,
+                                effective_bytes,
                                 2, (char *[]) {in_name, out_name});
             }
 
@@ -436,7 +711,7 @@ static inline int handle_output_event(uint64_t ts,
 
             /* OLD metrics API */
 #ifdef FLB_HAVE_METRICS
-            flb_metrics_sum(FLB_METRIC_OUT_DROPPED_RECORDS, task->records, ins->metrics);
+            flb_metrics_sum(FLB_METRIC_OUT_DROPPED_RECORDS, effective_records, ins->metrics);
 #endif
             flb_info("[engine] chunk '%s' is not retried (no retry config): "
                      "task_id=%i, input=%s > output=%s (out_id=%i)",
@@ -465,17 +740,17 @@ static inline int handle_output_event(uint64_t ts,
 
             /* cmetrics */
             cmt_counter_inc(ins->cmt_retries_failed, ts, 1, (char *[]) {out_name});
-            cmt_counter_add(ins->cmt_dropped_records, ts, task->records,
+            cmt_counter_add(ins->cmt_dropped_records, ts, effective_records,
                             1, (char *[]) {out_name});
 
             if (config->router && task->event_chunk &&
                 task->event_chunk->type == FLB_EVENT_TYPE_LOGS) {
                 cmt_counter_add(config->router->logs_drop_records_total, ts,
-                                task->records,
+                                effective_records,
                                 2, (char *[]) {in_name, out_name});
 
                 cmt_counter_add(config->router->logs_drop_bytes_total, ts,
-                                task->event_chunk->size,
+                                effective_bytes,
                                 2, (char *[]) {in_name, out_name});
             }
 
@@ -486,7 +761,7 @@ static inline int handle_output_event(uint64_t ts,
             /* OLD metrics API */
 #ifdef FLB_HAVE_METRICS
             flb_metrics_sum(FLB_METRIC_OUT_RETRY_FAILED, 1, ins->metrics);
-            flb_metrics_sum(FLB_METRIC_OUT_DROPPED_RECORDS, task->records, ins->metrics);
+            flb_metrics_sum(FLB_METRIC_OUT_DROPPED_RECORDS, effective_records, ins->metrics);
 #endif
             /* Notify about this failed retry */
             flb_error("[engine] chunk '%s' cannot be retried: "
@@ -538,8 +813,13 @@ static inline int handle_output_event(uint64_t ts,
 
             /* cmetrics */
             cmt_counter_inc(ins->cmt_retries, ts, 1, (char *[]) {out_name});
-            cmt_counter_add(ins->cmt_retried_records, ts, task->records,
+            cmt_counter_add(ins->cmt_retried_records, ts, effective_records,
                             1, (char *[]) {out_name});
+            if (ins->cmt_backpressure_wait) {
+                cmt_histogram_observe(ins->cmt_backpressure_wait, ts,
+                                      (double) retry_seconds, 1,
+                                      (char *[]) {out_name});
+            }
 
             cmt_gauge_set(ins->cmt_chunk_available_capacity_percent, ts,
                           calculate_chunk_capacity_percent(ins),
@@ -548,7 +828,7 @@ static inline int handle_output_event(uint64_t ts,
             /* OLD metrics API: update the metrics since a new retry is coming */
 #ifdef FLB_HAVE_METRICS
             flb_metrics_sum(FLB_METRIC_OUT_RETRY, 1, ins->metrics);
-            flb_metrics_sum(FLB_METRIC_OUT_RETRIED_RECORDS, task->records, ins->metrics);
+            flb_metrics_sum(FLB_METRIC_OUT_RETRIED_RECORDS, effective_records, ins->metrics);
 #endif
         }
     }
@@ -556,17 +836,17 @@ static inline int handle_output_event(uint64_t ts,
         handle_dlq_if_available(config, task, ins, 0);
         /* cmetrics */
         cmt_counter_inc(ins->cmt_errors, ts, 1, (char *[]) {out_name});
-        cmt_counter_add(ins->cmt_dropped_records, ts, task->records,
+        cmt_counter_add(ins->cmt_dropped_records, ts, effective_records,
                         1, (char *[]) {out_name});
 
         if (config->router && task->event_chunk &&
             task->event_chunk->type == FLB_EVENT_TYPE_LOGS) {
             cmt_counter_add(config->router->logs_drop_records_total, ts,
-                            task->records,
+                            effective_records,
                             2, (char *[]) {in_name, out_name});
 
             cmt_counter_add(config->router->logs_drop_bytes_total, ts,
-                            task->event_chunk->size,
+                            effective_bytes,
                             2, (char *[]) {in_name, out_name});
         }
 
@@ -577,7 +857,7 @@ static inline int handle_output_event(uint64_t ts,
         /* OLD API */
 #ifdef FLB_HAVE_METRICS
         flb_metrics_sum(FLB_METRIC_OUT_ERROR, 1, ins->metrics);
-        flb_metrics_sum(FLB_METRIC_OUT_DROPPED_RECORDS, task->records, ins->metrics);
+        flb_metrics_sum(FLB_METRIC_OUT_DROPPED_RECORDS, effective_records, ins->metrics);
 #endif
 
         flb_task_retry_clean(task, ins);
@@ -654,6 +934,16 @@ static inline int flb_engine_manager(flb_pipefd_t fd, struct flb_config *config)
     /* Flush all remaining data */
     if (type == 1) {                  /* Engine type */
         if (key == FLB_ENGINE_STOP) {
+            /*
+             * Re-entering the STOP handler in flb_engine_start() would reset
+             * config->event_shutdown.status while the shutdown timerfd is
+             * still registered, so the dispatcher drops the timer and the
+             * pipeline thread busy-loops on epoll.
+             */
+            if (config->is_shutting_down) {
+                flb_debug("[engine] duplicate STOP ignored");
+                return 0;
+            }
             flb_trace("[engine] flush enqueued data");
             flb_engine_flush(config, NULL);
             return FLB_ENGINE_STOP;
@@ -678,6 +968,7 @@ static FLB_INLINE int flb_engine_handle_event(flb_pipefd_t fd, int mask,
         if (config->flush_fd == fd) {
             flb_utils_timer_consume(fd);
             flb_engine_flush(config, NULL);
+            flb_engine_adaptive_flush_update(config);
             return 0;
         }
         else if (config->shutdown_fd == fd) {
@@ -809,7 +1100,6 @@ int flb_engine_start(struct flb_config *config)
     uint64_t ts;
     char tmp[16];
     int rb_flush_flag;
-    struct flb_time t_flush;
     struct mk_event *event;
     struct mk_event_loop *evl;
     struct flb_bucket_queue *evl_bktq;
@@ -870,6 +1160,15 @@ int flb_engine_start(struct flb_config *config)
     if (ret == -1) {
         fprintf(stderr, "[engine] log start failed\n");
         return -1;
+    }
+
+    ret = flb_fips_init(config);
+    if (ret != 0) {
+        return -1;
+    }
+
+    if (engine_has_fluentbit_logs_input(config)) {
+        flb_log_pipeline_enable(config);
     }
 
     flb_info("[fluent bit] version=%s, commit=%.10s, pid=%i",
@@ -983,14 +1282,13 @@ int flb_engine_start(struct flb_config *config)
     event->mask = MK_EVENT_EMPTY;
     event->status = MK_EVENT_NONE;
 
-    flb_time_from_double(&t_flush, config->flush);
-    config->flush_fd = mk_event_timeout_create(evl,
-                                               t_flush.tm.tv_sec,
-                                               t_flush.tm.tv_nsec,
-                                               event);
-    event->priority = FLB_ENGINE_PRIORITY_FLUSH;
-    if (config->flush_fd == -1) {
-        flb_utils_error(FLB_ERR_CFG_FLUSH_CREATE);
+    flb_engine_adaptive_flush_init(config);
+
+    if (flb_engine_flush_timer_reset(config,
+                                     config->flush_adaptive_current_interval) == -1) {
+        flb_error("[engine] could not initialize flush timer (interval=%.3f sec)",
+                  config->flush_adaptive_current_interval);
+        return -1;
     }
 
 
@@ -1024,7 +1322,16 @@ int flb_engine_start(struct flb_config *config)
     if (config->http_server == FLB_TRUE) {
         config->http_ctx = flb_hs_create(config->http_listen, config->http_port,
                                          config);
-        flb_hs_start(config->http_ctx);
+        if (!config->http_ctx) {
+            flb_error("[engine] could not initialize HTTP server");
+            return -1;
+        }
+
+        ret = flb_hs_start(config->http_ctx);
+        if (ret != 0) {
+            flb_error("[engine] could not start HTTP server");
+            return -1;
+        }
     }
 #endif
 
@@ -1241,7 +1548,12 @@ int flb_engine_start(struct flb_config *config)
                 if (connection->coroutine) {
                     flb_trace("[engine] resuming coroutine=%p", connection->coroutine);
 
-                    flb_coro_resume(connection->coroutine);
+                    if (connection->event_coroutine != NULL) {
+                        flb_downstream_conn_event_resume(connection);
+                    }
+                    else {
+                        flb_coro_resume(connection->coroutine);
+                    }
                 }
             }
             else if (event->type == FLB_ENGINE_EV_OUTPUT) {

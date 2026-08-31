@@ -56,23 +56,7 @@ static void reset_context(struct cmt_decode_prometheus_context *context,
         cfl_sds_destroy(context->metric.labels[i]);
     }
 
-    if (context->metric.ns) {
-        if ((void *) context->metric.ns != (void *) "") {
-            /* when namespace is empty, "name" contains a pointer to the
-             * allocated string.
-             *
-             * Note : When the metric name doesn't include the namespace
-             * ns is set to a constant empty string and we need to
-             * differentiate that case from the case where an empty
-             * namespace is provided.
-             */
-
-            free(context->metric.ns);
-        }
-        else {
-            free(context->metric.name);
-        }
-    }
+    free(context->metric.name_buf);
 
     cfl_sds_destroy(context->strbuf);
     context->strbuf = NULL;
@@ -124,16 +108,18 @@ int cmt_decode_prometheus_create(
 
     result = cmt_decode_prometheus_parse(scanner, &context);
 
+    if (context.errcode) {
+        result = context.errcode;
+    }
+
     if (result == 0) {
         *out_cmt = cmt;
     }
     else {
         cmt_destroy(cmt);
-        if (context.errcode) {
-            result = context.errcode;
-        }
-        reset_context(&context, true);
     }
+
+    reset_context(&context, true);
 
     cmt_decode_prometheus__delete_buffer(buf, scanner);
     cmt_decode_prometheus_lex_destroy(scanner);
@@ -164,13 +150,18 @@ static int split_metric_name(struct cmt_decode_prometheus_context *context,
         cfl_sds_t metric_name, char **ns,
         char **subsystem, char **name)
 {
+    char *name_buf;
+
     /* split the name */
-    *ns = strdup(metric_name);
-    if (!*ns) {
+    name_buf = strdup(metric_name);
+    if (name_buf == NULL) {
         return report_error(context,
                 CMT_DECODE_PROMETHEUS_ALLOCATION_ERROR,
                 "memory allocation failed");
     }
+
+    context->metric.name_buf = name_buf;
+    *ns = name_buf;
     *subsystem = strchr(*ns, '_');
     if (!(*subsystem)) {
         *name = *ns;
@@ -441,8 +432,10 @@ static int add_metric_histogram(struct cmt_decode_prometheus_context *context)
 {
     int ret = 0;
     int i;
+    int has_le = CMT_FALSE;
     size_t bucket_count;
     size_t bucket_index;
+    size_t label_count = 0;
     double *buckets = NULL;
     uint64_t *bucket_defaults = NULL;
     double sum = 0;
@@ -488,14 +481,30 @@ static int add_metric_histogram(struct cmt_decode_prometheus_context *context)
                 "failed to allocate buckets");
         goto end;
     }
-    labels_without_le = calloc(context->metric.label_count - 1, sizeof(*labels_without_le));
+    for (i = 0; i < context->metric.label_count; i++) {
+        if (!strcmp(context->metric.labels[i], "le")) {
+            has_le = CMT_TRUE;
+        }
+        else {
+            label_count++;
+        }
+    }
+
+    if (!has_le) {
+        ret = report_error(context,
+                CMT_DECODE_PROMETHEUS_SYNTAX_ERROR,
+                "missing histogram bucket \"le\" label");
+        goto end;
+    }
+
+    labels_without_le = calloc(label_count, sizeof(*labels_without_le));
     if (!labels_without_le) {
         ret = report_error(context,
                 CMT_DECODE_PROMETHEUS_CMT_CREATE_ERROR,
                 "failed to allocate labels_without_le");
         goto end;
     }
-    values_without_le = calloc(context->metric.label_count - 1, sizeof(*labels_without_le));
+    values_without_le = calloc(label_count, sizeof(*values_without_le));
     if (!values_without_le) {
         ret = report_error(context,
                 CMT_DECODE_PROMETHEUS_CMT_CREATE_ERROR,
@@ -524,6 +533,13 @@ static int add_metric_histogram(struct cmt_decode_prometheus_context *context)
                 if (bucket_index == bucket_count) {
                     /* probably last bucket, which has "Inf" */
                     break;
+                }
+                if (!sample->label_values[le_label_index] ||
+                    sample->label_values[le_label_index][0] == '\0') {
+                    ret = report_error(context,
+                            CMT_DECODE_PROMETHEUS_SYNTAX_ERROR,
+                            "missing histogram bucket \"le\" value");
+                    goto end;
                 }
                 if (parse_double(sample->label_values[le_label_index],
                             buckets + bucket_index)) {
@@ -1199,6 +1215,9 @@ static int cmt_decode_prometheus_error(void *yyscanner,
                                        struct cmt_decode_prometheus_context *context,
                                        const char *msg)
 {
-    report_error(context, CMT_DECODE_PROMETHEUS_SYNTAX_ERROR, msg);
+    if (!context->errcode) {
+        report_error(context, CMT_DECODE_PROMETHEUS_SYNTAX_ERROR, msg);
+    }
+
     return 0;
 }

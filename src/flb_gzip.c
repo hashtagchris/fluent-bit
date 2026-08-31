@@ -704,12 +704,13 @@ static int flb_gzip_decompressor_process_header(
     context->read_buffer = &context->read_buffer[FLB_GZIP_HEADER_SIZE];
     context->input_buffer_length -= FLB_GZIP_HEADER_SIZE;
 
-    /* Magic bytes */
-    if (inner_context->gzip_header.magic_number != FLB_GZIP_MAGIC_NUMBER) {
+    /* Magic bytes (stored in little endian order in the header) */
+    if (read_le16((unsigned char *) &inner_context->gzip_header.magic_number) !=
+        FLB_GZIP_MAGIC_NUMBER) {
         context->state = FLB_DECOMPRESSOR_STATE_FAILED;
 
         flb_error("[gzip] invalid magic bytes : %04x",
-                  inner_context->gzip_header.magic_number);
+                  read_le16((unsigned char *) &inner_context->gzip_header.magic_number));
 
         return FLB_DECOMPRESSOR_FAILURE;
     }
@@ -745,7 +746,7 @@ static int flb_gzip_decompressor_process_optional_headers(
     struct flb_gzip_decompression_context *inner_context;
     int                                    status;
     uint16_t                               hcrc;
-    uint16_t                               xlen;
+    size_t                                 xlen;
     uint16_t                               crc;
 
     inner_context = (struct flb_gzip_decompression_context *) \
@@ -806,6 +807,8 @@ static int flb_gzip_decompressor_process_optional_headers(
             xlen == context->input_buffer_length) {
             return FLB_DECOMPRESSOR_INSUFFICIENT_DATA;
         }
+
+        xlen++;
 
         context->read_buffer = &context->read_buffer[xlen];
         context->input_buffer_length -= xlen;
@@ -1007,9 +1010,20 @@ void *flb_gzip_decompression_context_create()
 
 void flb_gzip_decompression_context_destroy(void *context)
 {
-    if (context != NULL) {
-        flb_free(context);
+    struct flb_gzip_decompression_context *inner_context;
+
+    if (context == NULL) {
+        return;
     }
+
+    inner_context = (struct flb_gzip_decompression_context *) context;
+
+    if (inner_context->miniz_stream.state != NULL) {
+        mz_inflateEnd(&inner_context->miniz_stream);
+        memset(&inner_context->miniz_stream, 0, sizeof(mz_stream));
+    }
+
+    flb_free(inner_context);
 }
 
 int flb_is_http_session_gzip_compressed(struct mk_http_session *session)
