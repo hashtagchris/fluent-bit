@@ -23,7 +23,7 @@ pipeline:
       dcr_id: dcr-suite
       table_name: suite_CL
       compress: on
-      batching_enabled: on
+      buffering_enabled: on
       batch_size: 175
       batch_timeout: 3s
       store_dir: ${AZURE_LOGS_INGESTION_STORE_DIR}
