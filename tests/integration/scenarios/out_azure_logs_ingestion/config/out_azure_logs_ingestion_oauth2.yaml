@@ -22,8 +22,6 @@ pipeline:
       dcr_id: dcr-suite
       table_name: suite_CL
       compress: on
-      batch_timeout: 1s
-      store_dir: ${AZURE_LOGS_INGESTION_STORE_DIR}
       tls.verify: on
       tls.verify_hostname: on
       tls.vhost: localhost
