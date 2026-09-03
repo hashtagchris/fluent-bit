@@ -33,7 +33,7 @@
 #define FLB_AZ_LI_TLS_MODE          FLB_IO_TLS
 /* refresh token every 60 minutes */
 #define FLB_AZ_LI_TOKEN_TIMEOUT 3600
-#define FLB_AZ_LI_BATCH_SIZE    "900K"
+#define FLB_AZ_LI_BATCH_SIZE    "1048576"
 #define FLB_AZ_LI_BATCH_TIMEOUT "30s"
 #define FLB_AZ_LI_STORE_DIR     "/tmp/fluent-bit/azure-logs-ingestion"
 
@@ -62,6 +62,7 @@ struct flb_az_li {
     int compress_enabled;
 
     /* request batching */
+    int batching_enabled;
     size_t batch_size;
     int batch_timeout;
     flb_sds_t store_dir;

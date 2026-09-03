@@ -41,6 +41,9 @@ struct flb_az_li_batch {
 
 int flb_az_li_batch_init(struct flb_az_li *ctx);
 void flb_az_li_batch_destroy_context(struct flb_az_li *ctx);
+int flb_az_li_batch_format_chunk(struct flb_az_li *ctx,
+                                 const void *data, size_t size,
+                                 flb_sds_t *payload);
 int flb_az_li_batch_append(struct flb_az_li *ctx, const void *data, size_t size);
 int flb_az_li_batch_prepare(struct flb_az_li *ctx,
                             struct flb_az_li_batch *batch);

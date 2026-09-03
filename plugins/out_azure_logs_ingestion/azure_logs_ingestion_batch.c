@@ -345,6 +345,78 @@ static flb_sds_t format_record(struct flb_az_li *ctx,
     return record;
 }
 
+int flb_az_li_batch_format_chunk(struct flb_az_li *ctx,
+                                 const void *data, size_t size,
+                                 flb_sds_t *payload)
+{
+    int ret;
+    int decoder_result;
+    int first_record;
+    flb_sds_t record;
+    flb_sds_t formatted_payload;
+    struct flb_log_event_decoder decoder;
+    struct flb_log_event log_event;
+
+    formatted_payload = flb_sds_create_size(size);
+    if (formatted_payload == NULL) {
+        flb_errno();
+        return -1;
+    }
+
+    ret = flb_sds_cat_safe(&formatted_payload, "[", 1);
+    if (ret == -1) {
+        flb_sds_destroy(formatted_payload);
+        return -1;
+    }
+
+    ret = flb_log_event_decoder_init(&decoder, (char *) data, size);
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_sds_destroy(formatted_payload);
+        return -1;
+    }
+
+    first_record = FLB_TRUE;
+    while ((decoder_result = flb_log_event_decoder_next(&decoder, &log_event)) ==
+           FLB_EVENT_DECODER_SUCCESS) {
+        record = format_record(ctx, &log_event);
+        if (record == NULL) {
+            flb_log_event_decoder_destroy(&decoder);
+            flb_sds_destroy(formatted_payload);
+            return -1;
+        }
+
+        if (first_record == FLB_FALSE) {
+            ret = flb_sds_cat_safe(&formatted_payload, ",", 1);
+        }
+        else {
+            ret = 0;
+            first_record = FLB_FALSE;
+        }
+
+        if (ret == 0) {
+            ret = flb_sds_cat_safe(&formatted_payload, record, flb_sds_len(record));
+        }
+        flb_sds_destroy(record);
+
+        if (ret == -1) {
+            flb_log_event_decoder_destroy(&decoder);
+            flb_sds_destroy(formatted_payload);
+            return -1;
+        }
+    }
+
+    flb_log_event_decoder_destroy(&decoder);
+    if (decoder_result != FLB_EVENT_DECODER_ERROR_INSUFFICIENT_DATA ||
+        flb_sds_cat_safe(&formatted_payload, "]", 1) == -1) {
+        flb_sds_destroy(formatted_payload);
+        return -1;
+    }
+
+    *payload = formatted_payload;
+
+    return 0;
+}
+
 static int batch_record_add(struct flb_az_li_batch *batch,
                             struct flb_fstore_file *file,
                             size_t end_offset)

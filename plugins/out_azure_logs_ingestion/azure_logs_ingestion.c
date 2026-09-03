@@ -18,6 +18,7 @@
  */
 
 #include <fluent-bit/flb_output_plugin.h>
+#include <fluent-bit/flb_gzip.h>
 #include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_oauth2.h>
 
@@ -122,13 +123,13 @@ token_cleanup:
     return token_return;
 }
 
-static int send_batch(struct flb_az_li *ctx, struct flb_az_li_batch *batch)
+static int send_payload(struct flb_az_li *ctx,
+                        void *payload, size_t payload_size,
+                        int compressed)
 {
     int ret;
     int flush_status;
     size_t b_sent;
-    void *final_payload;
-    size_t final_payload_size;
     flb_sds_t token = NULL;
     struct flb_connection *u_conn;
     struct flb_http_client *c = NULL;
@@ -144,27 +145,18 @@ static int send_batch(struct flb_az_li *ctx, struct flb_az_li_batch *batch)
         goto cleanup;
     }
 
-    if (ctx->compress_enabled == FLB_TRUE) {
-        final_payload = batch->compressed_payload;
-        final_payload_size = batch->compressed_size;
-    }
-    else {
-        final_payload = batch->payload;
-        final_payload_size = flb_sds_len(batch->payload);
-    }
-
     c = flb_http_client(u_conn, FLB_HTTP_POST, ctx->dce_u_url,
-                        final_payload, final_payload_size, NULL, 0, NULL, 0);
+                        payload, payload_size, NULL, 0, NULL, 0);
 
     if (!c) {
-        flb_plg_warn(ctx->ins, "retrying payload bytes=%lu", final_payload_size);
+        flb_plg_warn(ctx->ins, "retrying payload bytes=%lu", payload_size);
         flush_status = FLB_RETRY;
         goto cleanup;
     }
 
     flb_http_add_header(c, "User-Agent", 10, "Fluent-Bit", 10);
     flb_http_add_header(c, "Content-Type", 12, "application/json", 16);
-    if (ctx->compress_enabled == FLB_TRUE) {
+    if (compressed == FLB_TRUE) {
         flb_http_add_header(c, "Content-Encoding", 16, "gzip", 4);
     }
     flb_http_add_header(c, "Authorization", 13, token, flb_sds_len(token));
@@ -191,7 +183,7 @@ static int send_batch(struct flb_az_li *ctx, struct flb_az_li_batch *batch)
             else {
                 flb_plg_warn(ctx->ins, "http_status=%i", c->resp.status);
             }
-            flb_plg_debug(ctx->ins, "retrying payload bytes=%lu", final_payload_size);
+            flb_plg_debug(ctx->ins, "retrying payload bytes=%lu", payload_size);
             flush_status = FLB_RETRY;
             goto cleanup;
         }
@@ -211,6 +203,17 @@ cleanup:
     }
 
     return flush_status;
+}
+
+static int send_batch(struct flb_az_li *ctx, struct flb_az_li_batch *batch)
+{
+    if (ctx->compress_enabled == FLB_TRUE) {
+        return send_payload(ctx, batch->compressed_payload,
+                            batch->compressed_size, FLB_TRUE);
+    }
+
+    return send_payload(ctx, batch->payload,
+                        flb_sds_len(batch->payload), FLB_FALSE);
 }
 
 static int process_batches(struct flb_az_li *ctx)
@@ -314,6 +317,10 @@ static int cb_azure_logs_ingestion_pre_run(void *data, struct flb_config *config
 
     (void) config;
 
+    if (ctx->batching_enabled == FLB_FALSE) {
+        return 0;
+    }
+
     if (batch_timer_create(ctx) == -1) {
         flb_plg_error(ctx->ins, "could not create the batch flush timer");
         return -1;
@@ -329,11 +336,51 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
                                           struct flb_config *config)
 {
     int ret;
+    int compressed;
+    size_t payload_size;
+    void *compressed_payload;
+    flb_sds_t payload;
     struct flb_az_li *ctx = out_context;
 
     (void) out_flush;
     (void) i_ins;
     (void) config;
+
+    if (ctx->batching_enabled == FLB_FALSE) {
+        payload = NULL;
+        compressed_payload = NULL;
+        compressed = FLB_FALSE;
+
+        ret = flb_az_li_batch_format_chunk(ctx, event_chunk->data,
+                                           event_chunk->size, &payload);
+        if (ret == -1) {
+            FLB_OUTPUT_RETURN(FLB_ERROR);
+        }
+        payload_size = flb_sds_len(payload);
+
+        if (ctx->compress_enabled == FLB_TRUE) {
+            ret = flb_gzip_compress(payload, payload_size,
+                                    &compressed_payload, &payload_size);
+            if (ret == -1) {
+                flb_plg_error(ctx->ins,
+                              "cannot gzip payload, disabling compression");
+            }
+            else {
+                compressed = FLB_TRUE;
+            }
+        }
+
+        if (compressed == FLB_TRUE) {
+            ret = send_payload(ctx, compressed_payload, payload_size, FLB_TRUE);
+            flb_free(compressed_payload);
+        }
+        else {
+            ret = send_payload(ctx, payload, payload_size, FLB_FALSE);
+        }
+        flb_sds_destroy(payload);
+
+        FLB_OUTPUT_RETURN(ret);
+    }
 
     if (batch_timer_create(ctx) == -1) {
         FLB_OUTPUT_RETURN(FLB_RETRY);
@@ -420,6 +467,11 @@ static struct flb_config_map config_map[] = {
      FLB_CONFIG_MAP_BOOL, "compress", "false",
      0, FLB_TRUE,  offsetof(struct flb_az_li, compress_enabled),
      "Enable HTTP payload compression (gzip)."
+    },
+    {
+     FLB_CONFIG_MAP_BOOL, "batching_enabled", "false",
+     0, FLB_TRUE, offsetof(struct flb_az_li, batching_enabled),
+     "Enable request batching by size and timeout."
     },
     {
      FLB_CONFIG_MAP_SIZE, "batch_size", FLB_AZ_LI_BATCH_SIZE,
