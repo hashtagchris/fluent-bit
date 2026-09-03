@@ -161,7 +161,7 @@ struct flb_az_li* flb_az_li_ctx_create(struct flb_output_instance *ins,
         flb_az_li_ctx_destroy(ctx);
         return NULL;
     }
-    if (ctx->batching_enabled == FLB_TRUE) {
+    if (ctx->buffering_enabled == FLB_TRUE) {
         if (ctx->batch_size == 0) {
             flb_plg_error(ins, "property 'batch_size' must be greater than zero");
             flb_az_li_ctx_destroy(ctx);
@@ -234,7 +234,7 @@ struct flb_az_li* flb_az_li_ctx_create(struct flb_output_instance *ins,
     }
     flb_output_upstream_set(ctx->u_dce, ins);
 
-    if (ctx->batching_enabled == FLB_TRUE) {
+    if (ctx->buffering_enabled == FLB_TRUE) {
         ret = flb_az_li_batch_init(ctx);
         if (ret == -1) {
             flb_plg_error(ins, "cannot initialize batch storage at '%s'",

@@ -317,7 +317,7 @@ static int cb_azure_logs_ingestion_pre_run(void *data, struct flb_config *config
 
     (void) config;
 
-    if (ctx->batching_enabled == FLB_FALSE) {
+    if (ctx->buffering_enabled == FLB_FALSE) {
         return 0;
     }
 
@@ -346,7 +346,7 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
     (void) i_ins;
     (void) config;
 
-    if (ctx->batching_enabled == FLB_FALSE) {
+    if (ctx->buffering_enabled == FLB_FALSE) {
         payload = NULL;
         compressed_payload = NULL;
         compressed = FLB_FALSE;
@@ -469,9 +469,9 @@ static struct flb_config_map config_map[] = {
      "Enable HTTP payload compression (gzip)."
     },
     {
-     FLB_CONFIG_MAP_BOOL, "batching_enabled", "false",
-     0, FLB_TRUE, offsetof(struct flb_az_li, batching_enabled),
-     "Enable request batching by size and timeout."
+     FLB_CONFIG_MAP_BOOL, "buffering_enabled", "false",
+     0, FLB_TRUE, offsetof(struct flb_az_li, buffering_enabled),
+     "Enable request buffering and batching by size and timeout."
     },
     {
      FLB_CONFIG_MAP_SIZE, "batch_size", FLB_AZ_LI_BATCH_SIZE,

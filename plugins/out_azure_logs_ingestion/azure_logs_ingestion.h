@@ -62,7 +62,7 @@ struct flb_az_li {
     int compress_enabled;
 
     /* request batching */
-    int batching_enabled;
+    int buffering_enabled;
     size_t batch_size;
     int batch_timeout;
     flb_sds_t store_dir;
