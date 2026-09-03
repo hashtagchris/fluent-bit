@@ -6,10 +6,11 @@ service:
 
 pipeline:
   inputs:
-    - name: dummy
+    - name: http
+      listen: 127.0.0.1
+      port: ${FLUENT_BIT_TEST_LISTENER_PORT}
       tag: azure_logs_ingestion
-      dummy: '{"message":"hello from azure logs ingestion","source":"dummy","level":"info"}'
-      samples: 1
+      enable_health_endpoint: on
 
   outputs:
     - name: azure_logs_ingestion
@@ -22,7 +23,8 @@ pipeline:
       dcr_id: dcr-suite
       table_name: suite_CL
       compress: on
-      batch_timeout: 1s
+      batch_size: 175
+      batch_timeout: 3s
       store_dir: ${AZURE_LOGS_INGESTION_STORE_DIR}
       tls.verify: on
       tls.verify_hostname: on

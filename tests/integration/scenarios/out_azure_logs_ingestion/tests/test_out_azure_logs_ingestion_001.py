@@ -1,5 +1,8 @@
 import logging
 import os
+import shutil
+import tempfile
+import time
 
 import requests
 
@@ -20,6 +23,7 @@ class Service:
         cert_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../in_splunk/certificate"))
         self.tls_crt_file = os.path.join(cert_dir, "certificate.pem")
         self.tls_key_file = os.path.join(cert_dir, "private_key.pem")
+        self.store_dir = tempfile.mkdtemp(prefix="fluent-bit-azure-logs-ingestion-")
         self.oauth_server_port = None
         self.service = FluentBitTestService(
             self.config_file,
@@ -28,6 +32,7 @@ class Service:
             extra_env={
                 "CERTIFICATE_TEST": self.tls_crt_file,
                 "PRIVATE_KEY_TEST": self.tls_key_file,
+                "AZURE_LOGS_INGESTION_STORE_DIR": self.store_dir,
             },
             pre_start=self._start_receiver,
             post_stop=self._stop_receiver,
@@ -98,6 +103,8 @@ class Service:
         except requests.RequestException:
             pass
 
+        shutil.rmtree(self.store_dir, ignore_errors=True)
+
     def start(self):
         self.service.start()
         self.flb = self.service.flb
@@ -114,6 +121,21 @@ class Service:
             interval=0.5,
             description=f"{minimum_count} azure logs ingestion requests",
         )
+
+    def data_requests(self):
+        return [
+            request
+            for request in data_storage["requests"]
+            if request["path"] == "/dataCollectionRules/dcr-suite/streams/Custom-suite_CL"
+        ]
+
+    def send_log(self, message):
+        response = requests.post(
+            f"http://127.0.0.1:{self.flb_listener_port}/azure_logs_ingestion",
+            json={"message": message},
+            timeout=5,
+        )
+        response.raise_for_status()
 
 
 def test_out_azure_logs_ingestion_legacy_oauth2_and_payload_format():
@@ -154,3 +176,62 @@ def test_out_azure_logs_ingestion_legacy_oauth2_and_payload_format():
     assert payload[0]["source"] == "dummy"
     assert payload[0]["level"] == "info"
     assert isinstance(payload[0]["@timestamp"], (int, float))
+
+
+def test_out_azure_logs_ingestion_batches_by_compressed_size_and_timeout():
+    service = Service("out_azure_logs_ingestion_batching.yaml")
+    service.start()
+    configure_http_response(status_code=200, body={"status": "received"})
+    configure_oauth_token_response(
+        status_code=200,
+        body={"access_token": "oauth-access-token", "token_type": "Bearer", "expires_in": 300},
+    )
+
+    service.service.wait_for_http_endpoint(
+        f"http://127.0.0.1:{service.flb_listener_port}/health",
+        timeout=10,
+        interval=0.25,
+    )
+
+    messages = [
+        f"{index:02d}-"
+        "4f2f8db8-e337-4d2f-9cb2-17008f6de8ce-"
+        "ab8cc998-1ed2-46df-8728-b87681522731-"
+        f"{index * 7919:08x}"
+        for index in range(10)
+    ]
+
+    service.send_log(messages[0])
+    time.sleep(1.5)
+    assert service.data_requests() == []
+
+    for message in messages[1:]:
+        service.send_log(message)
+
+    first_batch = service.service.wait_for_condition(
+        lambda: service.data_requests()[0] if service.data_requests() else None,
+        timeout=10,
+        interval=0.25,
+        description="a compressed-size Azure Logs Ingestion batch",
+    )
+
+    assert 1 < len(first_batch["json"]) < len(messages)
+    assert first_batch["headers"].get("Content-Encoding") == "gzip"
+    assert int(first_batch["headers"]["Content-Length"]) <= 175
+
+    requests_seen = service.service.wait_for_condition(
+        lambda: service.data_requests()
+        if sum(len(request["json"]) for request in service.data_requests()) == len(messages)
+        else None,
+        timeout=10,
+        interval=0.25,
+        description="the timed-out partial Azure Logs Ingestion batch",
+    )
+    service.stop()
+
+    received_messages = [
+        record["message"]
+        for request in requests_seen
+        for record in request["json"]
+    ]
+    assert received_messages == messages
