@@ -1,6 +1,6 @@
 service:
   flush: 1
-  log_level: info
+  log_level: debug
   http_server: on
   http_port: ${FLUENT_BIT_HTTP_MONITORING_PORT}
 
@@ -25,7 +25,7 @@ pipeline:
       compress: on
       buffering_enabled: on
       batch_size: 175
-      batch_timeout: 3s
+      batch_timeout: 5s
       store_dir: ${AZURE_LOGS_INGESTION_STORE_DIR}
       tls.verify: on
       tls.verify_hostname: on
