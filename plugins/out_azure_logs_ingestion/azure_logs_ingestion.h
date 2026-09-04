@@ -42,6 +42,7 @@
 #include <fluent-bit/flb_output.h>
 #include <fluent-bit/flb_scheduler.h>
 #include <fluent-bit/flb_sds.h>
+#include <cmetrics/cmt_gauge.h>
 
 /* Context structure for Azure Logs Ingestion API */
 struct flb_az_li {
@@ -69,11 +70,20 @@ struct flb_az_li {
     size_t store_dir_limit_size;
     size_t buffered_size;
     uint64_t store_sequence;
+    uint64_t buffer_generation;
+    uint64_t last_probe_generation;
+    size_t last_probe_uncompressed_size;
+    double compression_ratio;
+    double average_compression_ratio;
     int batch_processing;
+    int batch_retry_pending;
     int timer_created;
     struct flb_fstore *fs;
     struct flb_fstore_stream *fs_stream;
     flb_sds_t fs_stream_name;
+#ifdef FLB_HAVE_METRICS
+    struct cmt_gauge *cmt_compression_ratio;
+#endif
     pthread_mutex_t batch_mutex;
     int batch_mutex_initialized;
 

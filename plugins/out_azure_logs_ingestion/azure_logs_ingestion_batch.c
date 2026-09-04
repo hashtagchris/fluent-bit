@@ -28,7 +28,10 @@
 
 #include "azure_logs_ingestion_batch.h"
 
-#define FLB_AZ_LI_BATCH_CHECK_MIN 65536
+#define FLB_AZ_LI_BATCH_MIN_PERCENT 70
+#define FLB_AZ_LI_BATCH_PERCENT_SCALE 100
+#define FLB_AZ_LI_COMPRESSION_RATIO_OLD_WEIGHT 0.75
+#define FLB_AZ_LI_COMPRESSION_RATIO_NEW_WEIGHT 0.25
 #define FLB_AZ_LI_STORE_META_VERSION 1
 
 struct flb_az_li_store_meta {
@@ -280,6 +283,7 @@ int flb_az_li_batch_append(struct flb_az_li *ctx, const void *data, size_t size)
     }
 
     ctx->buffered_size += size;
+    ctx->buffer_generation++;
     return 0;
 }
 
@@ -463,6 +467,80 @@ static int compress_prefix(struct flb_az_li_batch *batch, size_t record_count,
     return ret;
 }
 
+static size_t scale_size(size_t size, size_t numerator, size_t denominator)
+{
+    size_t quotient;
+    size_t remainder;
+
+    quotient = size / denominator;
+    remainder = size % denominator;
+
+    return quotient * numerator + remainder * numerator / denominator;
+}
+
+static size_t batch_minimum_size(struct flb_az_li *ctx)
+{
+    size_t minimum_size;
+
+    minimum_size = scale_size(ctx->batch_size,
+                              FLB_AZ_LI_BATCH_MIN_PERCENT,
+                              FLB_AZ_LI_BATCH_PERCENT_SCALE);
+    if (minimum_size == 0) {
+        minimum_size = 1;
+    }
+
+    return minimum_size;
+}
+
+static size_t batch_midpoint_size(struct flb_az_li *ctx)
+{
+    size_t minimum_size;
+
+    minimum_size = batch_minimum_size(ctx);
+
+    return minimum_size + (ctx->batch_size - minimum_size) / 2;
+}
+
+static void update_compression_ratio_estimate(struct flb_az_li *ctx,
+                                              size_t uncompressed_size,
+                                              size_t compressed_size)
+{
+    if (compressed_size == 0) {
+        return;
+    }
+
+    ctx->compression_ratio =
+        (double) uncompressed_size / (double) compressed_size;
+}
+
+static void update_average_compression_ratio(struct flb_az_li *ctx,
+                                             size_t uncompressed_size,
+                                             size_t compressed_size)
+{
+    double observed_ratio;
+
+    if (compressed_size == 0) {
+        return;
+    }
+
+    observed_ratio = (double) uncompressed_size / (double) compressed_size;
+    if (ctx->average_compression_ratio == 0) {
+        ctx->average_compression_ratio = observed_ratio;
+    }
+    else {
+        ctx->average_compression_ratio =
+            ctx->average_compression_ratio *
+                FLB_AZ_LI_COMPRESSION_RATIO_OLD_WEIGHT +
+            observed_ratio * FLB_AZ_LI_COMPRESSION_RATIO_NEW_WEIGHT;
+    }
+
+#ifdef FLB_HAVE_METRICS
+    cmt_gauge_set(ctx->cmt_compression_ratio, cfl_time_now(),
+                  ctx->average_compression_ratio, 1,
+                  (char *[]) {(char *) flb_output_name(ctx->ins)});
+#endif
+}
+
 static int measure_prefix(struct flb_az_li *ctx,
                           struct flb_az_li_batch *batch,
                           size_t record_count,
@@ -475,6 +553,8 @@ static int measure_prefix(struct flb_az_li *ctx,
     json_end = batch->records[record_count - 1].json_end;
     if (ctx->compress_enabled == FLB_FALSE) {
         *request_size = json_end + 1;
+        batch->measured_record_count = record_count;
+        batch->measured_size = *request_size;
         return 0;
     }
 
@@ -484,47 +564,109 @@ static int measure_prefix(struct flb_az_li *ctx,
         return -1;
     }
 
-    flb_free(compressed_payload);
+    if (batch->compressed_payload != NULL) {
+        flb_free(batch->compressed_payload);
+    }
+    batch->compressed_payload = compressed_payload;
+    batch->compressed_size = *request_size;
+    batch->measured_record_count = record_count;
+    batch->measured_size = *request_size;
+    batch->gzip_operations++;
+    ctx->last_probe_generation = ctx->buffer_generation;
+    ctx->last_probe_uncompressed_size = json_end + 1;
+
+    update_compression_ratio_estimate(ctx, json_end + 1, *request_size);
 
     return 0;
 }
 
-static int select_record_count(struct flb_az_li *ctx,
-                               struct flb_az_li_batch *batch,
-                               size_t last_good_count,
-                               size_t *selected_count)
+static size_t project_uncompressed_size(size_t uncompressed_size,
+                                       size_t compressed_size,
+                                       size_t target_size)
 {
-    int ret;
+    long double projected_size;
+
+    if (compressed_size == 0) {
+        return uncompressed_size;
+    }
+
+    projected_size = (long double) uncompressed_size * (long double) target_size /
+                     (long double) compressed_size;
+    if (projected_size >= (long double) SIZE_MAX) {
+        return SIZE_MAX;
+    }
+    if (projected_size < 1) {
+        return 1;
+    }
+
+    return (size_t) projected_size;
+}
+
+static size_t predicted_uncompressed_size(struct flb_az_li *ctx)
+{
+    long double predicted_size;
+    size_t midpoint_size;
+
+    midpoint_size = batch_midpoint_size(ctx);
+    if (ctx->compress_enabled == FLB_FALSE || ctx->compression_ratio <= 0) {
+        return midpoint_size;
+    }
+
+    predicted_size = (long double) midpoint_size *
+                     (long double) ctx->compression_ratio;
+    if (predicted_size >= (long double) SIZE_MAX) {
+        return SIZE_MAX;
+    }
+    if (predicted_size < 1) {
+        return 1;
+    }
+
+    return (size_t) predicted_size;
+}
+
+static size_t record_json_size(struct flb_az_li_batch *batch,
+                               size_t record_count)
+{
+    return batch->records[record_count - 1].json_end + 1;
+}
+
+static size_t nearest_record_count(struct flb_az_li_batch *batch,
+                                  size_t target_size,
+                                  size_t maximum_count)
+{
     size_t low;
     size_t high;
     size_t middle;
-    size_t request_size;
+    size_t previous_size;
+    size_t current_size;
 
-    low = last_good_count;
-    high = batch->record_count;
+    if (maximum_count == 1 ||
+        target_size <= record_json_size(batch, 1)) {
+        return 1;
+    }
+    if (target_size >= record_json_size(batch, maximum_count)) {
+        return maximum_count;
+    }
 
+    low = 1;
+    high = maximum_count;
     while (low < high) {
-        middle = low + (high - low + 1) / 2;
-
-        ret = measure_prefix(ctx, batch, middle, &request_size);
-        if (ret == -1) {
-            return -1;
-        }
-
-        if (request_size <= ctx->batch_size) {
-            low = middle;
+        middle = low + (high - low) / 2;
+        if (record_json_size(batch, middle) < target_size) {
+            low = middle + 1;
         }
         else {
-            high = middle - 1;
+            high = middle;
         }
     }
 
-    if (low == 0) {
-        low = 1;
+    current_size = record_json_size(batch, low);
+    previous_size = record_json_size(batch, low - 1);
+    if (target_size - previous_size <= current_size - target_size) {
+        return low - 1;
     }
 
-    *selected_count = low;
-    return 0;
+    return low;
 }
 
 static int finalize_batch(struct flb_az_li *ctx,
@@ -534,6 +676,14 @@ static int finalize_batch(struct flb_az_li *ctx,
     int ret;
     size_t json_end;
     size_t request_size;
+
+    if (ctx->compress_enabled == FLB_TRUE &&
+        batch->measured_record_count != selected_count) {
+        ret = measure_prefix(ctx, batch, selected_count, &request_size);
+        if (ret == -1) {
+            return -1;
+        }
+    }
 
     json_end = batch->records[selected_count - 1].json_end;
     flb_sds_len_set(batch->payload, json_end);
@@ -546,14 +696,12 @@ static int finalize_batch(struct flb_az_li *ctx,
 
     batch->record_count = selected_count;
     request_size = flb_sds_len(batch->payload);
+    batch->measured_record_count = selected_count;
+    batch->measured_size = request_size;
 
     if (ctx->compress_enabled == FLB_TRUE) {
-        ret = flb_gzip_compress(batch->payload, flb_sds_len(batch->payload),
-                                &batch->compressed_payload, &batch->compressed_size);
-        if (ret == -1) {
-            return -1;
-        }
         request_size = batch->compressed_size;
+        batch->measured_size = request_size;
     }
 
     if (selected_count == 1 && request_size > ctx->batch_size) {
@@ -563,7 +711,99 @@ static int finalize_batch(struct flb_az_li *ctx,
                      request_size, ctx->batch_size);
     }
 
+    flb_plg_debug(ctx->ins,
+                  "prepared buffered batch records=%zu bytes=%zu "
+                  "gzip_operations=%zu",
+                  selected_count, request_size, batch->gzip_operations);
+
     return 0;
+}
+
+static int finalize_oversized_batch(struct flb_az_li *ctx,
+                                   struct flb_az_li_batch *batch,
+                                   size_t record_count,
+                                   size_t request_size)
+{
+    int ret;
+    void *safe_payload;
+    size_t high_count;
+    size_t low_count;
+    size_t minimum_size;
+    size_t safe_count;
+    size_t safe_size;
+    size_t target_size;
+    size_t projected_size;
+    size_t selected_count;
+
+    safe_payload = NULL;
+    safe_count = 0;
+    safe_size = 0;
+    low_count = 0;
+    high_count = record_count;
+    minimum_size = batch_minimum_size(ctx);
+    target_size = batch_midpoint_size(ctx);
+
+    while (1) {
+        if (request_size <= ctx->batch_size) {
+            if (request_size >= minimum_size) {
+                flb_free(safe_payload);
+                return finalize_batch(ctx, batch, record_count);
+            }
+
+            if (ctx->compress_enabled == FLB_TRUE) {
+                flb_free(safe_payload);
+                safe_payload = batch->compressed_payload;
+                batch->compressed_payload = NULL;
+            }
+            safe_count = record_count;
+            safe_size = request_size;
+            low_count = record_count;
+        }
+        else {
+            high_count = record_count;
+        }
+
+        if (high_count <= 1) {
+            flb_free(safe_payload);
+            return finalize_batch(ctx, batch, 1);
+        }
+
+        if (low_count + 1 >= high_count) {
+            if (safe_count == 0) {
+                flb_free(safe_payload);
+                return finalize_batch(ctx, batch, 1);
+            }
+
+            if (ctx->compress_enabled == FLB_TRUE) {
+                flb_free(batch->compressed_payload);
+                batch->compressed_payload = safe_payload;
+                batch->compressed_size = safe_size;
+                safe_payload = NULL;
+            }
+            batch->measured_record_count = safe_count;
+            batch->measured_size = safe_size;
+
+            return finalize_batch(ctx, batch, safe_count);
+        }
+
+        projected_size = project_uncompressed_size(
+            record_json_size(batch, record_count), request_size, target_size);
+        selected_count = nearest_record_count(batch, projected_size,
+                                             high_count - 1);
+        if (selected_count <= low_count) {
+            selected_count = low_count + 1;
+        }
+        if (selected_count >= high_count) {
+            selected_count = high_count - 1;
+        }
+
+        ret = measure_prefix(ctx, batch, selected_count, &request_size);
+        if (ret == -1) {
+            flb_free(safe_payload);
+            return -1;
+        }
+        record_count = selected_count;
+    }
 }
 
 static int batch_is_expired(struct flb_az_li *ctx,
@@ -608,9 +848,9 @@ int flb_az_li_batch_prepare(struct flb_az_li *ctx,
 {
     int ret;
     int decoder_result;
-    int crossed_target;
-    size_t last_good_count;
-    size_t selected_count;
+    int expired;
+    size_t minimum_size;
+    size_t midpoint_size;
     size_t next_check;
     size_t file_size;
     size_t request_size;
@@ -636,9 +876,9 @@ int flb_az_li_batch_prepare(struct flb_az_li *ctx,
         return -1;
     }
 
-    crossed_target = FLB_FALSE;
-    last_good_count = 0;
-    next_check = FLB_AZ_LI_BATCH_CHECK_MIN;
+    minimum_size = batch_minimum_size(ctx);
+    midpoint_size = batch_midpoint_size(ctx);
+    next_check = predicted_uncompressed_size(ctx);
 
     mk_list_foreach_safe(head, temporary, &ctx->fs_stream->files) {
         file = mk_list_entry(head, struct flb_fstore_file, _head);
@@ -719,27 +959,40 @@ int flb_az_li_batch_prepare(struct flb_az_li *ctx,
                     return -1;
                 }
 
-                if (request_size >= ctx->batch_size) {
-                    crossed_target = FLB_TRUE;
-                    break;
+                if (request_size > ctx->batch_size) {
+                    flb_log_event_decoder_destroy(&decoder);
+                    flb_free(file_data);
+                    ret = finalize_oversized_batch(ctx, batch,
+                                                   batch->record_count,
+                                                   request_size);
+                    if (ret == -1) {
+                        flb_az_li_batch_destroy(batch);
+                        return -1;
+                    }
+                    return 1;
                 }
 
-                last_good_count = batch->record_count;
-                next_check = flb_sds_len(batch->payload) * 2;
-                if (next_check < flb_sds_len(batch->payload) +
-                                 FLB_AZ_LI_BATCH_CHECK_MIN) {
-                    next_check = flb_sds_len(batch->payload) +
-                                 FLB_AZ_LI_BATCH_CHECK_MIN;
+                if (request_size >= minimum_size) {
+                    flb_log_event_decoder_destroy(&decoder);
+                    flb_free(file_data);
+                    if (finalize_batch(ctx, batch, batch->record_count) == -1) {
+                        flb_az_li_batch_destroy(batch);
+                        return -1;
+                    }
+                    return 1;
+                }
+
+                next_check = project_uncompressed_size(
+                    record_json_size(batch, batch->record_count),
+                    request_size, midpoint_size);
+                if (next_check <= flb_sds_len(batch->payload)) {
+                    next_check = flb_sds_len(batch->payload) + 1;
                 }
             }
         }
 
         flb_log_event_decoder_destroy(&decoder);
         flb_free(file_data);
-
-        if (crossed_target == FLB_TRUE) {
-            break;
-        }
 
         if (decoder_result != FLB_EVENT_DECODER_ERROR_INSUFFICIENT_DATA) {
             flb_plg_error(ctx->ins, "invalid log data in buffered batch file '%s'",
@@ -760,36 +1013,41 @@ int flb_az_li_batch_prepare(struct flb_az_li *ctx,
         return 0;
     }
 
-    if (crossed_target == FLB_TRUE) {
-        ret = select_record_count(ctx, batch, last_good_count, &selected_count);
-        if (ret == -1 || finalize_batch(ctx, batch, selected_count) == -1) {
+    expired = batch_is_expired(ctx, batch);
+    if (batch->measured_record_count != batch->record_count &&
+        (expired == FLB_TRUE ||
+         ctx->batch_retry_pending == FLB_TRUE ||
+         (ctx->compress_enabled == FLB_TRUE &&
+          flb_sds_len(batch->payload) >= minimum_size &&
+          (ctx->last_probe_generation != ctx->buffer_generation ||
+           flb_sds_len(batch->payload) >
+               ctx->last_probe_uncompressed_size)))) {
+        ret = measure_prefix(ctx, batch, batch->record_count, &request_size);
+        if (ret == -1) {
             flb_az_li_batch_destroy(batch);
             return -1;
         }
-        return 1;
     }
-
-    ret = measure_prefix(ctx, batch, batch->record_count, &request_size);
-    if (ret == -1) {
-        flb_az_li_batch_destroy(batch);
-        return -1;
+    else if (batch->measured_record_count == batch->record_count) {
+        request_size = batch->measured_size;
     }
-
-    if (request_size >= ctx->batch_size) {
-        ret = select_record_count(ctx, batch, last_good_count, &selected_count);
-        if (ret == -1 || finalize_batch(ctx, batch, selected_count) == -1) {
-            flb_az_li_batch_destroy(batch);
-            return -1;
-        }
-        return 1;
-    }
-
-    if (batch_is_expired(ctx, batch) == FLB_FALSE) {
+    else {
         flb_az_li_batch_destroy(batch);
         return 0;
     }
 
-    if (finalize_batch(ctx, batch, batch->record_count) == -1) {
+    if (request_size > ctx->batch_size) {
+        ret = finalize_oversized_batch(ctx, batch, batch->record_count,
+                                       request_size);
+    }
+    else if (request_size >= minimum_size || expired == FLB_TRUE) {
+        ret = finalize_batch(ctx, batch, batch->record_count);
+    }
+    else {
+        flb_az_li_batch_destroy(batch);
+        return 0;
+    }
+    if (ret == -1) {
         flb_az_li_batch_destroy(batch);
         return -1;
     }
@@ -849,6 +1107,12 @@ int flb_az_li_batch_commit(struct flb_az_li *ctx,
 
         index = last_index + 1;
     }
+
+    if (ctx->compress_enabled == FLB_TRUE) {
+        update_average_compression_ratio(ctx, flb_sds_len(batch->payload),
+                                         batch->compressed_size);
+    }
+    ctx->buffer_generation++;
 
     return 0;
 }

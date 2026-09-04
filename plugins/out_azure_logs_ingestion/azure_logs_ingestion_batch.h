@@ -34,6 +34,9 @@ struct flb_az_li_batch {
     flb_sds_t payload;
     void *compressed_payload;
     size_t compressed_size;
+    size_t measured_record_count;
+    size_t measured_size;
+    size_t gzip_operations;
     struct flb_az_li_batch_record *records;
     size_t record_count;
     size_t record_capacity;

@@ -244,6 +244,24 @@ struct flb_az_li* flb_az_li_ctx_create(struct flb_output_instance *ins,
         }
     }
 
+#ifdef FLB_HAVE_METRICS
+    ctx->cmt_compression_ratio = cmt_gauge_create(
+        ins->cmt,
+        "fluentbit",
+        "azure_logs_ingestion",
+        "compression_ratio",
+        "Adaptive average ratio of uncompressed JSON bytes to gzip bytes.",
+        1, (char *[]) {"name"});
+    if (ctx->cmt_compression_ratio == NULL) {
+        flb_plg_error(ins, "cannot create compression ratio metric");
+        flb_az_li_ctx_destroy(ctx);
+        return NULL;
+    }
+
+    cmt_gauge_set(ctx->cmt_compression_ratio, cfl_time_now(), 0,
+                 1, (char *[]) {(char *) flb_output_name(ins)});
+#endif
+
     flb_plg_info(ins, "dce_url='%s', dcr='%s', table='%s', stream='Custom-%s'",
                 ctx->dce_url, ctx->dcr_id, ctx->table_name, ctx->table_name);
 

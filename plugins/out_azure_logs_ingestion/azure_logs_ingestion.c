@@ -250,6 +250,9 @@ static int process_batches(struct flb_az_li *ctx)
 
         ret = send_batch(ctx, &batch);
         if (ret != FLB_OK) {
+            pthread_mutex_lock(&ctx->batch_mutex);
+            ctx->batch_retry_pending = FLB_TRUE;
+            pthread_mutex_unlock(&ctx->batch_mutex);
             flb_az_li_batch_destroy(&batch);
             result = -1;
             break;
@@ -257,6 +260,9 @@ static int process_batches(struct flb_az_li *ctx)
 
         pthread_mutex_lock(&ctx->batch_mutex);
         ret = flb_az_li_batch_commit(ctx, &batch);
+        if (ret == 0) {
+            ctx->batch_retry_pending = FLB_FALSE;
+        }
         pthread_mutex_unlock(&ctx->batch_mutex);
         flb_az_li_batch_destroy(&batch);
 
@@ -476,8 +482,9 @@ static struct flb_config_map config_map[] = {
     {
      FLB_CONFIG_MAP_SIZE, "batch_size", FLB_AZ_LI_BATCH_SIZE,
      0, FLB_TRUE, offsetof(struct flb_az_li, batch_size),
-     "Set the target request size after optional compression. Batches are "
-     "split on record boundaries and sent when they reach this size."
+     "Set the maximum request size after optional compression. Batches are "
+     "split on record boundaries and normally sent between 70% and 100% of "
+     "this size."
     },
     {
      FLB_CONFIG_MAP_TIME, "batch_timeout", FLB_AZ_LI_BATCH_TIMEOUT,
