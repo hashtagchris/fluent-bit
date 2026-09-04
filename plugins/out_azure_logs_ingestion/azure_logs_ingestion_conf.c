@@ -162,8 +162,22 @@ struct flb_az_li* flb_az_li_ctx_create(struct flb_output_instance *ins,
         return NULL;
     }
     if (ctx->buffering_enabled == FLB_TRUE) {
-        if (ctx->batch_size == 0) {
-            flb_plg_error(ins, "property 'batch_size' must be greater than zero");
+        if (ctx->max_batch_size == 0) {
+            flb_plg_error(ins,
+                          "property 'max_batch_size' must be greater than zero");
+            flb_az_li_ctx_destroy(ctx);
+            return NULL;
+        }
+        if (ctx->min_batch_size == 0) {
+            flb_plg_error(ins,
+                          "property 'min_batch_size' must be greater than zero");
+            flb_az_li_ctx_destroy(ctx);
+            return NULL;
+        }
+        if (ctx->min_batch_size > ctx->max_batch_size) {
+            flb_plg_error(ins,
+                          "property 'min_batch_size' must not exceed "
+                          "'max_batch_size'");
             flb_az_li_ctx_destroy(ctx);
             return NULL;
         }
@@ -260,6 +274,22 @@ struct flb_az_li* flb_az_li_ctx_create(struct flb_output_instance *ins,
 
     cmt_gauge_set(ctx->cmt_compression_ratio, cfl_time_now(), 0,
                  1, (char *[]) {(char *) flb_output_name(ins)});
+
+    ctx->cmt_gzip_operations = cmt_counter_create(
+        ins->cmt,
+        "fluentbit",
+        "azure_logs_ingestion",
+        "gzip_operations_total",
+        "Total number of gzip operations performed.",
+        1, (char *[]) {"name"});
+    if (ctx->cmt_gzip_operations == NULL) {
+        flb_plg_error(ins, "cannot create gzip operations metric");
+        flb_az_li_ctx_destroy(ctx);
+        return NULL;
+    }
+
+    cmt_counter_set(ctx->cmt_gzip_operations, cfl_time_now(), 0,
+                   1, (char *[]) {(char *) flb_output_name(ins)});
 #endif
 
     flb_plg_info(ins, "dce_url='%s', dcr='%s', table='%s', stream='Custom-%s'",

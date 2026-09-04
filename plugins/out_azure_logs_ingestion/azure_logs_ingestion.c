@@ -365,8 +365,8 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
         payload_size = flb_sds_len(payload);
 
         if (ctx->compress_enabled == FLB_TRUE) {
-            ret = flb_gzip_compress(payload, payload_size,
-                                    &compressed_payload, &payload_size);
+            ret = flb_az_li_gzip_compress(ctx, payload, payload_size,
+                                          &compressed_payload, &payload_size);
             if (ret == -1) {
                 flb_plg_error(ctx->ins,
                               "cannot gzip payload, disabling compression");
@@ -480,11 +480,16 @@ static struct flb_config_map config_map[] = {
      "Enable request buffering and batching by size and timeout."
     },
     {
-     FLB_CONFIG_MAP_SIZE, "batch_size", FLB_AZ_LI_BATCH_SIZE,
-     0, FLB_TRUE, offsetof(struct flb_az_li, batch_size),
-     "Set the maximum request size after optional compression. Batches are "
-     "split on record boundaries and normally sent between 70% and 100% of "
-     "this size."
+     FLB_CONFIG_MAP_SIZE, "max_batch_size", FLB_AZ_LI_MAX_BATCH_SIZE,
+     0, FLB_TRUE, offsetof(struct flb_az_li, max_batch_size),
+     "Set the maximum request size after optional compression."
+    },
+    {
+     FLB_CONFIG_MAP_SIZE, "min_batch_size", FLB_AZ_LI_MIN_BATCH_SIZE,
+     0, FLB_TRUE, offsetof(struct flb_az_li, min_batch_size),
+     "Set the minimum request size before an unexpired batch is sent. "
+     "Batch selection targets 90% of the range between the minimum and "
+     "maximum sizes."
     },
     {
      FLB_CONFIG_MAP_TIME, "batch_timeout", FLB_AZ_LI_BATCH_TIMEOUT,
