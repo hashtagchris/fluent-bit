@@ -18,6 +18,12 @@ from utils.test_service import FluentBitTestService
 
 logger = logging.getLogger(__name__)
 
+MAX_BATCH_SIZE = 175
+MIN_BATCH_SIZE = 122
+TARGET_BATCH_SIZE = MIN_BATCH_SIZE + (
+    (MAX_BATCH_SIZE - MIN_BATCH_SIZE) * 90 // 100
+)
+
 
 class Service:
     def __init__(self, config_file):
@@ -148,6 +154,15 @@ class Service:
             for record_count, request_size, gzip_operations in matches
         ]
 
+    def prometheus_metrics(self):
+        response = requests.get(
+            f"http://127.0.0.1:{self.flb.http_monitoring_port}"
+            "/api/v2/metrics/prometheus",
+            timeout=5,
+        )
+        response.raise_for_status()
+        return response.text
+
     def send_log(self, message):
         response = requests.post(
             f"http://127.0.0.1:{self.flb_listener_port}/azure_logs_ingestion",
@@ -167,6 +182,25 @@ def test_out_azure_logs_ingestion_legacy_oauth2_and_payload_format():
     )
 
     requests_seen = service.wait_for_requests(2, timeout=15)
+
+    def immediate_gzip_operations():
+        metrics = service.prometheus_metrics()
+        match = re.search(
+            r'fluentbit_azure_logs_ingestion_gzip_operations_total'
+            r'\{[^}]*name="azure_logs_ingestion\.0"[^}]*\}\s+([0-9.eE+-]+)',
+            metrics,
+        )
+        if match is not None and int(float(match.group(1))) == 1:
+            return 1
+
+        return None
+
+    gzip_operations = service.service.wait_for_condition(
+        immediate_gzip_operations,
+        timeout=5,
+        interval=0.25,
+        description="one immediate Azure Logs Ingestion gzip operation",
+    )
     service.stop()
 
     token_request = next(request for request in requests_seen if request["path"] == "/oauth/token")
@@ -195,6 +229,7 @@ def test_out_azure_logs_ingestion_legacy_oauth2_and_payload_format():
     assert payload[0]["source"] == "dummy"
     assert payload[0]["level"] == "info"
     assert isinstance(payload[0]["@timestamp"], (int, float))
+    assert gzip_operations == 1
 
 
 def test_out_azure_logs_ingestion_batches_by_compressed_size_and_timeout():
@@ -237,7 +272,11 @@ def test_out_azure_logs_ingestion_batches_by_compressed_size_and_timeout():
 
     assert 1 < len(first_batch["json"]) < len(messages)
     assert first_batch["headers"].get("Content-Encoding") == "gzip"
-    assert 122 <= int(first_batch["headers"]["Content-Length"]) <= 175
+    assert (
+        MIN_BATCH_SIZE <=
+        int(first_batch["headers"]["Content-Length"]) <=
+        MAX_BATCH_SIZE
+    )
 
     service.service.wait_for_condition(
         lambda: service.data_requests()
@@ -273,52 +312,69 @@ def test_out_azure_logs_ingestion_batches_by_compressed_size_and_timeout():
     for observed_ratio in observed_ratios[1:]:
         expected_ratio = expected_ratio * 0.75 + observed_ratio * 0.25
 
-    def compression_ratio_metric():
-        response = requests.get(
-            f"http://127.0.0.1:{service.flb.http_monitoring_port}"
-            "/api/v2/metrics/prometheus",
-            timeout=5,
-        )
-        response.raise_for_status()
+    batch_preparations = service.batch_preparations()
+    expected_gzip_operations = sum(
+        preparation["gzip_operations"] for preparation in batch_preparations
+    )
+
+    def compression_metrics():
+        metrics = service.prometheus_metrics()
         match = re.search(
             r'fluentbit_azure_logs_ingestion_compression_ratio'
             r'\{[^}]*name="azure_logs_ingestion\.0"[^}]*\}\s+([0-9.eE+-]+)',
-            response.text,
+            metrics,
         )
         if match is None:
             return None
 
-        ratio = float(match.group(1))
-        return ratio if math.isclose(ratio, expected_ratio, rel_tol=1e-6) else None
+        gzip_match = re.search(
+            r'fluentbit_azure_logs_ingestion_gzip_operations_total'
+            r'\{[^}]*name="azure_logs_ingestion\.0"[^}]*\}\s+([0-9.eE+-]+)',
+            metrics,
+        )
+        if gzip_match is None:
+            return None
 
-    compression_ratio = service.service.wait_for_condition(
-        compression_ratio_metric,
+        ratio = float(match.group(1))
+        gzip_operations = int(float(gzip_match.group(1)))
+        if (math.isclose(ratio, expected_ratio, rel_tol=1e-6) and
+                gzip_operations == expected_gzip_operations):
+            return ratio, gzip_operations
+
+        return None
+
+    compression_ratio, gzip_operations = service.service.wait_for_condition(
+        compression_metrics,
         timeout=5,
         interval=0.25,
-        description="the Azure Logs Ingestion compression ratio metric",
+        description="the Azure Logs Ingestion compression metrics",
     )
     assert compression_ratio > 1
+    assert gzip_operations > 0
 
-    batch_preparations = service.batch_preparations()
     service.stop()
 
     full_batches = [
         preparation
         for preparation in batch_preparations
-        if preparation["bytes"] >= 122
+        if preparation["bytes"] >= MIN_BATCH_SIZE
     ]
     assert len(full_batches) >= 3
-    assert all(preparation["bytes"] <= 175 for preparation in full_batches)
-    assert 130 <= (
-        sum(preparation["bytes"] for preparation in full_batches) /
-        len(full_batches)
-    ) <= 166
+    assert all(
+        preparation["bytes"] <= MAX_BATCH_SIZE
+        for preparation in full_batches
+    )
+    steady_batch_average = (
+        sum(preparation["bytes"] for preparation in full_batches[2:]) /
+        len(full_batches[2:])
+    )
+    assert abs(steady_batch_average - TARGET_BATCH_SIZE) <= 10
     assert (
         sum(preparation["gzip_operations"] for preparation in full_batches) /
         len(full_batches)
     ) < 2
     assert len(batch_preparations) == len(requests_seen)
-    assert batch_preparations[-1]["bytes"] < 122
+    assert batch_preparations[-1]["bytes"] < MIN_BATCH_SIZE
     assert batch_preparations[-1]["records"] == 1
 
     received_messages = [
