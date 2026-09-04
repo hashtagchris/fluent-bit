@@ -18,20 +18,12 @@
  */
 
 #include <fluent-bit/flb_output_plugin.h>
+#include <fluent-bit/flb_gzip.h>
 #include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_oauth2.h>
-#include <fluent-bit/flb_base64.h>
-#include <fluent-bit/flb_crypto.h>
-#include <fluent-bit/flb_gzip.h>
-#include <fluent-bit/flb_hmac.h>
-#include <fluent-bit/flb_pack.h>
-#include <fluent-bit/flb_mp.h>
-#include <fluent-bit/flb_utils.h>
-#include <fluent-bit/flb_time.h>
-#include <fluent-bit/flb_log_event_decoder.h>
-#include <msgpack.h>
 
 #include "azure_logs_ingestion.h"
+#include "azure_logs_ingestion_batch.h"
 #include "azure_logs_ingestion_conf.h"
 
 static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
@@ -48,117 +40,6 @@ static int cb_azure_logs_ingestion_init(struct flb_output_instance *ins,
         flb_plg_error(ins, "configuration failed");
         return -1;
     }
-
-    return 0;
-}
-
-/* A duplicate function copied from the azure log analytics plugin.
-    allocates sds string */
-static int az_li_format(const void *in_buf, size_t in_bytes,
-                        char **out_buf, size_t *out_size,
-                        struct flb_az_li *ctx,
-                        struct flb_config *config)
-{
-    int i;
-    int ret;
-    int array_size = 0;
-    int map_size;
-    double t;
-    struct flb_time tm;
-    struct flb_log_event_decoder log_decoder;
-    struct flb_log_event log_event;
-    msgpack_object map;
-    msgpack_object k;
-    msgpack_object v;
-    msgpack_sbuffer mp_sbuf;
-    msgpack_packer mp_pck;
-    msgpack_sbuffer tmp_sbuf;
-    msgpack_packer tmp_pck;
-    flb_sds_t record;
-    char time_formatted[32];
-    size_t s;
-    struct tm tms;
-    int len;
-
-    /* Count number of items */
-    array_size = flb_mp_count_log_records(in_buf, in_bytes);
-
-    /* Create temporary msgpack buffer */
-    msgpack_sbuffer_init(&mp_sbuf);
-    msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
-    msgpack_pack_array(&mp_pck, array_size);
-
-    ret = flb_log_event_decoder_init(&log_decoder, (char *) in_buf, in_bytes);
-    if (ret != FLB_EVENT_DECODER_SUCCESS) {
-        msgpack_sbuffer_destroy(&mp_sbuf);
-        return -1;
-    }
-
-    while ((ret = flb_log_event_decoder_next(&log_decoder, &log_event)) ==
-           FLB_EVENT_DECODER_SUCCESS) {
-        flb_time_copy(&tm, &log_event.timestamp);
-
-        /* Create temporary msgpack buffer */
-        msgpack_sbuffer_init(&tmp_sbuf);
-        msgpack_packer_init(&tmp_pck, &tmp_sbuf, msgpack_sbuffer_write);
-
-        map = *log_event.body;
-        map_size = map.via.map.size;
-
-        msgpack_pack_map(&mp_pck, map_size + 1);
-
-        /* Append the time key */
-        msgpack_pack_str(&mp_pck, flb_sds_len(ctx->time_key));
-        msgpack_pack_str_body(&mp_pck,
-                            ctx->time_key,
-                            flb_sds_len(ctx->time_key));
-
-        if (ctx->time_generated == FLB_TRUE) {
-            /* Append the time value as ISO 8601 */
-            gmtime_r(&tm.tm.tv_sec, &tms);
-            s = strftime(time_formatted, sizeof(time_formatted) - 1,
-                            FLB_PACK_JSON_DATE_ISO8601_FMT, &tms);
-
-            len = snprintf(time_formatted + s,
-                            sizeof(time_formatted) - 1 - s,
-                            ".%03" PRIu64 "Z",
-                            (uint64_t) tm.tm.tv_nsec / 1000000);
-            s += len;
-            msgpack_pack_str(&mp_pck, s);
-            msgpack_pack_str_body(&mp_pck, time_formatted, s);
-        }
-        else {
-            /* Append the time value as millis.nanos */
-            t = flb_time_to_double(&tm);
-            msgpack_pack_double(&mp_pck, t);
-        }
-
-        /* Append original map k/v */
-        for (i = 0; i < map_size; i++) {
-            k = map.via.map.ptr[i].key;
-            v = map.via.map.ptr[i].val;
-
-            msgpack_pack_object(&tmp_pck, k);
-            msgpack_pack_object(&tmp_pck, v);
-        }
-        msgpack_sbuffer_write(&mp_sbuf, tmp_sbuf.data, tmp_sbuf.size);
-        msgpack_sbuffer_destroy(&tmp_sbuf);
-    }
-
-    record = flb_msgpack_raw_to_json_sds(mp_sbuf.data, mp_sbuf.size,
-                                         config->json_escape_unicode);
-    if (!record) {
-        flb_errno();
-        msgpack_sbuffer_destroy(&mp_sbuf);
-        flb_log_event_decoder_destroy(&log_decoder);
-        return -1;
-    }
-
-    msgpack_sbuffer_destroy(&mp_sbuf);
-    flb_log_event_decoder_destroy(&log_decoder);
-
-    *out_buf = record;
-    *out_size = flb_sds_len(record);
 
     return 0;
 }
@@ -242,86 +123,45 @@ token_cleanup:
     return token_return;
 }
 
-static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
-                           struct flb_output_flush *out_flush,
-                           struct flb_input_instance *i_ins,
-                           void *out_context,
-                           struct flb_config *config)
+static int send_payload(struct flb_az_li *ctx,
+                        void *payload, size_t payload_size,
+                        int compressed)
 {
     int ret;
     int flush_status;
     size_t b_sent;
-    size_t json_payload_size;
-    void* final_payload;
-    size_t final_payload_size;
-    flb_sds_t token;
+    flb_sds_t token = NULL;
     struct flb_connection *u_conn;
     struct flb_http_client *c = NULL;
-    int is_compressed = FLB_FALSE;
-    flb_sds_t json_payload = NULL;
-    struct flb_az_li *ctx = out_context;
-    (void) i_ins;
-    (void) config;
 
-    /* Get upstream connection */
     u_conn = flb_upstream_conn_get(ctx->u_dce);
     if (!u_conn) {
-        FLB_OUTPUT_RETURN(FLB_RETRY);
+        return FLB_RETRY;
     }
 
-    /* Convert binary logs into a JSON payload */
-    ret = az_li_format(event_chunk->data, event_chunk->size,
-                       &json_payload, &json_payload_size, ctx,
-                       config);
-    if (ret == -1) {
-        flb_upstream_conn_release(u_conn);
-        FLB_OUTPUT_RETURN(FLB_ERROR);
-    }
-
-    /* Get OAuth2 token */
     token = get_az_li_token(ctx);
     if (!token) {
         flush_status = FLB_RETRY;
         goto cleanup;
     }
 
-    /* Map buffer */
-    final_payload = json_payload;
-    final_payload_size = json_payload_size;
-    if (ctx->compress_enabled == FLB_TRUE) {
-        ret = flb_gzip_compress((void *) json_payload, json_payload_size,
-                                &final_payload, &final_payload_size);
-        if (ret == -1) {
-            flb_plg_error(ctx->ins,
-                          "cannot gzip payload, disabling compression");
-        }
-        else {
-            is_compressed = FLB_TRUE;
-            flb_plg_debug(ctx->ins, "enabled payload gzip compression");
-            /* JSON buffer will be cleared at cleanup: */
-        }
-    }
-
-    /* Compose HTTP Client request */
     c = flb_http_client(u_conn, FLB_HTTP_POST, ctx->dce_u_url,
-                        final_payload, final_payload_size, NULL, 0, NULL, 0);
+                        payload, payload_size, NULL, 0, NULL, 0);
 
     if (!c) {
-        flb_plg_warn(ctx->ins, "retrying payload bytes=%lu", final_payload_size);
+        flb_plg_warn(ctx->ins, "retrying payload bytes=%lu", payload_size);
         flush_status = FLB_RETRY;
         goto cleanup;
     }
 
-    /* Append headers */
     flb_http_add_header(c, "User-Agent", 10, "Fluent-Bit", 10);
     flb_http_add_header(c, "Content-Type", 12, "application/json", 16);
-    if (is_compressed) {
+    if (compressed == FLB_TRUE) {
         flb_http_add_header(c, "Content-Encoding", 16, "gzip", 4);
     }
     flb_http_add_header(c, "Authorization", 13, token, flb_sds_len(token));
     flb_http_buffer_size(c, FLB_HTTP_DATA_SIZE_MAX);
 
-    /* Execute rest call */
     ret = flb_http_do(c, &b_sent);
     if (ret != 0) {
         flb_plg_warn(ctx->ins, "http_do=%i", ret);
@@ -343,23 +183,13 @@ static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
             else {
                 flb_plg_warn(ctx->ins, "http_status=%i", c->resp.status);
             }
-            flb_plg_debug(ctx->ins, "retrying payload bytes=%lu", final_payload_size);
+            flb_plg_debug(ctx->ins, "retrying payload bytes=%lu", payload_size);
             flush_status = FLB_RETRY;
             goto cleanup;
         }
     }
 
 cleanup:
-    /* cleanup */
-    if (json_payload) {
-        flb_sds_destroy(json_payload);
-    }
-
-    /* release compressed payload */
-    if (is_compressed == FLB_TRUE) {
-        flb_free(final_payload);
-    }
-
     if (c) {
         flb_http_client_destroy(c);
     }
@@ -371,7 +201,209 @@ cleanup:
     if (token) {
         flb_sds_destroy(token);
     }
-    FLB_OUTPUT_RETURN(flush_status);
+
+    return flush_status;
+}
+
+static int send_batch(struct flb_az_li *ctx, struct flb_az_li_batch *batch)
+{
+    if (ctx->compress_enabled == FLB_TRUE) {
+        return send_payload(ctx, batch->compressed_payload,
+                            batch->compressed_size, FLB_TRUE);
+    }
+
+    return send_payload(ctx, batch->payload,
+                        flb_sds_len(batch->payload), FLB_FALSE);
+}
+
+static int process_batches(struct flb_az_li *ctx)
+{
+    int ret;
+    int result;
+    struct flb_az_li_batch batch;
+
+    pthread_mutex_lock(&ctx->batch_mutex);
+    if (ctx->batch_processing == FLB_TRUE) {
+        pthread_mutex_unlock(&ctx->batch_mutex);
+        return 0;
+    }
+    ctx->batch_processing = FLB_TRUE;
+    pthread_mutex_unlock(&ctx->batch_mutex);
+
+    result = 0;
+
+    while (1) {
+        pthread_mutex_lock(&ctx->batch_mutex);
+        ret = flb_az_li_batch_prepare(ctx, &batch);
+        pthread_mutex_unlock(&ctx->batch_mutex);
+
+        if (ret == FLB_AZ_LI_BATCH_CORRUPT_FILE) {
+            continue;
+        }
+
+        if (ret <= 0) {
+            if (ret == -1) {
+                result = -1;
+            }
+            break;
+        }
+
+        ret = send_batch(ctx, &batch);
+        if (ret != FLB_OK) {
+            pthread_mutex_lock(&ctx->batch_mutex);
+            ctx->batch_retry_pending = FLB_TRUE;
+            pthread_mutex_unlock(&ctx->batch_mutex);
+            flb_az_li_batch_destroy(&batch);
+            result = -1;
+            break;
+        }
+
+        pthread_mutex_lock(&ctx->batch_mutex);
+        ret = flb_az_li_batch_commit(ctx, &batch);
+        if (ret == 0) {
+            ctx->batch_retry_pending = FLB_FALSE;
+        }
+        pthread_mutex_unlock(&ctx->batch_mutex);
+        flb_az_li_batch_destroy(&batch);
+
+        if (ret == -1) {
+            flb_plg_error(ctx->ins, "could not commit the buffered batch");
+            result = -1;
+            break;
+        }
+    }
+
+    pthread_mutex_lock(&ctx->batch_mutex);
+    ctx->batch_processing = FLB_FALSE;
+    pthread_mutex_unlock(&ctx->batch_mutex);
+
+    return result;
+}
+
+static void batch_timer_callback(struct flb_config *config, void *data)
+{
+    struct flb_az_li *ctx = data;
+
+    (void) config;
+
+    process_batches(ctx);
+    flb_sched_timer_cb_coro_return();
+}
+
+static int batch_timer_create(struct flb_az_li *ctx)
+{
+    int ret;
+    struct flb_sched *scheduler;
+
+    pthread_mutex_lock(&ctx->batch_mutex);
+    if (ctx->timer_created == FLB_TRUE) {
+        pthread_mutex_unlock(&ctx->batch_mutex);
+        return 0;
+    }
+
+    scheduler = flb_sched_ctx_get();
+    if (scheduler == NULL) {
+        pthread_mutex_unlock(&ctx->batch_mutex);
+        return -1;
+    }
+
+    ret = flb_sched_timer_coro_cb_create(scheduler, FLB_SCHED_TIMER_CB_PERM,
+                                         1000, batch_timer_callback, ctx, NULL);
+    if (ret == 0) {
+        ctx->timer_created = FLB_TRUE;
+    }
+    pthread_mutex_unlock(&ctx->batch_mutex);
+
+    return ret;
+}
+
+static int cb_azure_logs_ingestion_pre_run(void *data, struct flb_config *config)
+{
+    struct flb_az_li *ctx = data;
+
+    (void) config;
+
+    if (ctx->buffering_enabled == FLB_FALSE) {
+        return 0;
+    }
+
+    if (batch_timer_create(ctx) == -1) {
+        flb_plg_error(ctx->ins, "could not create the batch flush timer");
+        return -1;
+    }
+
+    return 0;
+}
+
+static void cb_azure_logs_ingestion_flush(struct flb_event_chunk *event_chunk,
+                                          struct flb_output_flush *out_flush,
+                                          struct flb_input_instance *i_ins,
+                                          void *out_context,
+                                          struct flb_config *config)
+{
+    int ret;
+    int compressed;
+    size_t payload_size;
+    void *compressed_payload;
+    flb_sds_t payload;
+    struct flb_az_li *ctx = out_context;
+
+    (void) out_flush;
+    (void) i_ins;
+    (void) config;
+
+    if (ctx->buffering_enabled == FLB_FALSE) {
+        payload = NULL;
+        compressed_payload = NULL;
+        compressed = FLB_FALSE;
+
+        ret = flb_az_li_batch_format_chunk(ctx, event_chunk->data,
+                                           event_chunk->size, &payload);
+        if (ret == -1) {
+            FLB_OUTPUT_RETURN(FLB_ERROR);
+        }
+        payload_size = flb_sds_len(payload);
+
+        if (ctx->compress_enabled == FLB_TRUE) {
+            ret = flb_az_li_gzip_compress(ctx, payload, payload_size,
+                                          &compressed_payload, &payload_size);
+            if (ret == -1) {
+                flb_plg_error(ctx->ins,
+                              "cannot gzip payload, disabling compression");
+            }
+            else {
+                compressed = FLB_TRUE;
+            }
+        }
+
+        if (compressed == FLB_TRUE) {
+            ret = send_payload(ctx, compressed_payload, payload_size, FLB_TRUE);
+            flb_free(compressed_payload);
+        }
+        else {
+            ret = send_payload(ctx, payload, payload_size, FLB_FALSE);
+        }
+        flb_sds_destroy(payload);
+
+        FLB_OUTPUT_RETURN(ret);
+    }
+
+    if (batch_timer_create(ctx) == -1) {
+        FLB_OUTPUT_RETURN(FLB_RETRY);
+    }
+
+    pthread_mutex_lock(&ctx->batch_mutex);
+    ret = flb_az_li_batch_append(ctx, event_chunk->data, event_chunk->size);
+    pthread_mutex_unlock(&ctx->batch_mutex);
+    if (ret == -1) {
+        FLB_OUTPUT_RETURN(FLB_RETRY);
+    }
+
+    if (process_batches(ctx) == -1) {
+        flb_plg_warn(ctx->ins, "buffered batches remain pending");
+    }
+
+    FLB_OUTPUT_RETURN(FLB_OK);
 }
 
 static int cb_azure_logs_ingestion_exit(void *data, struct flb_config *config)
@@ -442,6 +474,38 @@ static struct flb_config_map config_map[] = {
      0, FLB_TRUE,  offsetof(struct flb_az_li, compress_enabled),
      "Enable HTTP payload compression (gzip)."
     },
+    {
+     FLB_CONFIG_MAP_BOOL, "buffering_enabled", "false",
+     0, FLB_TRUE, offsetof(struct flb_az_li, buffering_enabled),
+     "Enable request buffering and batching by size and timeout."
+    },
+    {
+     FLB_CONFIG_MAP_SIZE, "max_batch_size", FLB_AZ_LI_MAX_BATCH_SIZE,
+     0, FLB_TRUE, offsetof(struct flb_az_li, max_batch_size),
+     "Set the maximum request size after optional compression."
+    },
+    {
+     FLB_CONFIG_MAP_SIZE, "min_batch_size", FLB_AZ_LI_MIN_BATCH_SIZE,
+     0, FLB_TRUE, offsetof(struct flb_az_li, min_batch_size),
+     "Set the minimum request size before an unexpired batch is sent. "
+     "Batch selection targets 90% of the range between the minimum and "
+     "maximum sizes."
+    },
+    {
+     FLB_CONFIG_MAP_TIME, "batch_timeout", FLB_AZ_LI_BATCH_TIMEOUT,
+     0, FLB_TRUE, offsetof(struct flb_az_li, batch_timeout),
+     "Set the maximum time to postpone an underfilled batch."
+    },
+    {
+     FLB_CONFIG_MAP_STR, "store_dir", FLB_AZ_LI_STORE_DIR,
+     0, FLB_TRUE, offsetof(struct flb_az_li, store_dir),
+     "Set the directory used to stage pending batches."
+    },
+    {
+     FLB_CONFIG_MAP_SIZE, "store_dir_limit_size", "0",
+     0, FLB_TRUE, offsetof(struct flb_az_li, store_dir_limit_size),
+     "Limit the staged batch data size (0 means unlimited)."
+    },
     /* EOF */
     {0}
 };
@@ -450,6 +514,7 @@ struct flb_output_plugin out_azure_logs_ingestion_plugin = {
     .name         = "azure_logs_ingestion",
     .description  = "Send logs to Log Analytics with Log Ingestion API",
     .cb_init      = cb_azure_logs_ingestion_init,
+    .cb_pre_run   = cb_azure_logs_ingestion_pre_run,
     .cb_flush     = cb_azure_logs_ingestion_flush,
     .cb_exit      = cb_azure_logs_ingestion_exit,
 
@@ -457,5 +522,6 @@ struct flb_output_plugin out_azure_logs_ingestion_plugin = {
     .config_map     = config_map,
 
     /* Plugin flags */
-    .flags          = FLB_OUTPUT_NET | FLB_IO_TLS,
+    .event_type     = FLB_OUTPUT_LOGS,
+    .flags          = FLB_OUTPUT_NET | FLB_IO_TLS | FLB_OUTPUT_SYNCHRONOUS,
 };

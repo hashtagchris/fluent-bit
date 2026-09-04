@@ -1,5 +1,10 @@
 import logging
+import math
 import os
+import re
+import shutil
+import tempfile
+import time
 
 import requests
 
@@ -13,6 +18,12 @@ from utils.test_service import FluentBitTestService
 
 logger = logging.getLogger(__name__)
 
+MAX_BATCH_SIZE = 175
+MIN_BATCH_SIZE = 122
+TARGET_BATCH_SIZE = MIN_BATCH_SIZE + (
+    (MAX_BATCH_SIZE - MIN_BATCH_SIZE) * 90 // 100
+)
+
 
 class Service:
     def __init__(self, config_file):
@@ -20,6 +31,7 @@ class Service:
         cert_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../in_splunk/certificate"))
         self.tls_crt_file = os.path.join(cert_dir, "certificate.pem")
         self.tls_key_file = os.path.join(cert_dir, "private_key.pem")
+        self.store_dir = tempfile.mkdtemp(prefix="fluent-bit-azure-logs-ingestion-")
         self.oauth_server_port = None
         self.service = FluentBitTestService(
             self.config_file,
@@ -28,6 +40,7 @@ class Service:
             extra_env={
                 "CERTIFICATE_TEST": self.tls_crt_file,
                 "PRIVATE_KEY_TEST": self.tls_key_file,
+                "AZURE_LOGS_INGESTION_STORE_DIR": self.store_dir,
             },
             pre_start=self._start_receiver,
             post_stop=self._stop_receiver,
@@ -98,6 +111,8 @@ class Service:
         except requests.RequestException:
             pass
 
+        shutil.rmtree(self.store_dir, ignore_errors=True)
+
     def start(self):
         self.service.start()
         self.flb = self.service.flb
@@ -115,6 +130,47 @@ class Service:
             description=f"{minimum_count} azure logs ingestion requests",
         )
 
+    def data_requests(self):
+        return [
+            request
+            for request in data_storage["requests"]
+            if request["path"] == "/dataCollectionRules/dcr-suite/streams/Custom-suite_CL"
+        ]
+
+    def batch_preparations(self):
+        with open(self.service.flb.log_file, "r", encoding="utf-8") as log_file:
+            matches = re.findall(
+                r"prepared buffered batch records=(\d+) bytes=(\d+) "
+                r"gzip_operations=(\d+)",
+                log_file.read(),
+            )
+
+        return [
+            {
+                "records": int(record_count),
+                "bytes": int(request_size),
+                "gzip_operations": int(gzip_operations),
+            }
+            for record_count, request_size, gzip_operations in matches
+        ]
+
+    def prometheus_metrics(self):
+        response = requests.get(
+            f"http://127.0.0.1:{self.flb.http_monitoring_port}"
+            "/api/v2/metrics/prometheus",
+            timeout=5,
+        )
+        response.raise_for_status()
+        return response.text
+
+    def send_log(self, message):
+        response = requests.post(
+            f"http://127.0.0.1:{self.flb_listener_port}/azure_logs_ingestion",
+            json={"message": message},
+            timeout=5,
+        )
+        response.raise_for_status()
+
 
 def test_out_azure_logs_ingestion_legacy_oauth2_and_payload_format():
     service = Service("out_azure_logs_ingestion_oauth2.yaml")
@@ -126,6 +182,25 @@ def test_out_azure_logs_ingestion_legacy_oauth2_and_payload_format():
     )
 
     requests_seen = service.wait_for_requests(2, timeout=15)
+
+    def immediate_gzip_operations():
+        metrics = service.prometheus_metrics()
+        match = re.search(
+            r'fluentbit_azure_logs_ingestion_gzip_operations_total'
+            r'\{[^}]*name="azure_logs_ingestion\.0"[^}]*\}\s+([0-9.eE+-]+)',
+            metrics,
+        )
+        if match is not None and int(float(match.group(1))) == 1:
+            return 1
+
+        return None
+
+    gzip_operations = service.service.wait_for_condition(
+        immediate_gzip_operations,
+        timeout=5,
+        interval=0.25,
+        description="one immediate Azure Logs Ingestion gzip operation",
+    )
     service.stop()
 
     token_request = next(request for request in requests_seen if request["path"] == "/oauth/token")
@@ -154,3 +229,157 @@ def test_out_azure_logs_ingestion_legacy_oauth2_and_payload_format():
     assert payload[0]["source"] == "dummy"
     assert payload[0]["level"] == "info"
     assert isinstance(payload[0]["@timestamp"], (int, float))
+    assert gzip_operations == 1
+
+
+def test_out_azure_logs_ingestion_batches_by_compressed_size_and_timeout():
+    service = Service("out_azure_logs_ingestion_batching.yaml")
+    service.start()
+    configure_http_response(status_code=200, body={"status": "received"})
+    configure_oauth_token_response(
+        status_code=200,
+        body={"access_token": "oauth-access-token", "token_type": "Bearer", "expires_in": 300},
+    )
+
+    service.service.wait_for_http_endpoint(
+        f"http://127.0.0.1:{service.flb_listener_port}/health",
+        timeout=10,
+        interval=0.25,
+    )
+
+    messages = ["underfilled"]
+    messages.extend(
+        f"{index:02d}-"
+        "4f2f8db8-e337-4d2f-9cb2-17008f6de8ce-"
+        "ab8cc998-1ed2-46df-8728-b87681522731-"
+        f"{index * 7919:08x}"
+        for index in range(30)
+    )
+
+    service.send_log(messages[0])
+    time.sleep(1.5)
+    assert service.data_requests() == []
+
+    for message in messages[1:]:
+        service.send_log(message)
+
+    first_batch = service.service.wait_for_condition(
+        lambda: service.data_requests()[0] if service.data_requests() else None,
+        timeout=10,
+        interval=0.25,
+        description="a compressed-size Azure Logs Ingestion batch",
+    )
+
+    assert 1 < len(first_batch["json"]) < len(messages)
+    assert first_batch["headers"].get("Content-Encoding") == "gzip"
+    assert (
+        MIN_BATCH_SIZE <=
+        int(first_batch["headers"]["Content-Length"]) <=
+        MAX_BATCH_SIZE
+    )
+
+    service.service.wait_for_condition(
+        lambda: service.data_requests()
+        if sum(len(request["json"]) for request in service.data_requests()) == len(messages)
+        else None,
+        timeout=10,
+        interval=0.25,
+        description="the full Azure Logs Ingestion batches",
+    )
+
+    request_count = len(service.data_requests())
+    timeout_message = "timeout-partial-batch"
+    service.send_log(timeout_message)
+    time.sleep(1.5)
+    assert len(service.data_requests()) == request_count
+
+    requests_seen = service.service.wait_for_condition(
+        lambda: service.data_requests()
+        if sum(len(request["json"]) for request in service.data_requests()) ==
+        len(messages) + 1
+        else None,
+        timeout=10,
+        interval=0.25,
+        description="the timed-out partial Azure Logs Ingestion batch",
+    )
+
+    observed_ratios = [
+        len(request["decoded_data"].encode("utf-8")) /
+        int(request["headers"]["Content-Length"])
+        for request in requests_seen
+    ]
+    expected_ratio = observed_ratios[0]
+    for observed_ratio in observed_ratios[1:]:
+        expected_ratio = expected_ratio * 0.75 + observed_ratio * 0.25
+
+    batch_preparations = service.batch_preparations()
+    expected_gzip_operations = sum(
+        preparation["gzip_operations"] for preparation in batch_preparations
+    )
+
+    def compression_metrics():
+        metrics = service.prometheus_metrics()
+        match = re.search(
+            r'fluentbit_azure_logs_ingestion_compression_ratio'
+            r'\{[^}]*name="azure_logs_ingestion\.0"[^}]*\}\s+([0-9.eE+-]+)',
+            metrics,
+        )
+        if match is None:
+            return None
+
+        gzip_match = re.search(
+            r'fluentbit_azure_logs_ingestion_gzip_operations_total'
+            r'\{[^}]*name="azure_logs_ingestion\.0"[^}]*\}\s+([0-9.eE+-]+)',
+            metrics,
+        )
+        if gzip_match is None:
+            return None
+
+        ratio = float(match.group(1))
+        gzip_operations = int(float(gzip_match.group(1)))
+        if (math.isclose(ratio, expected_ratio, rel_tol=1e-6) and
+                gzip_operations == expected_gzip_operations):
+            return ratio, gzip_operations
+
+        return None
+
+    compression_ratio, gzip_operations = service.service.wait_for_condition(
+        compression_metrics,
+        timeout=5,
+        interval=0.25,
+        description="the Azure Logs Ingestion compression metrics",
+    )
+    assert compression_ratio > 1
+    assert gzip_operations > 0
+
+    service.stop()
+
+    full_batches = [
+        preparation
+        for preparation in batch_preparations
+        if preparation["bytes"] >= MIN_BATCH_SIZE
+    ]
+    assert len(full_batches) >= 3
+    assert all(
+        preparation["bytes"] <= MAX_BATCH_SIZE
+        for preparation in full_batches
+    )
+    steady_batch_average = (
+        sum(preparation["bytes"] for preparation in full_batches[2:]) /
+        len(full_batches[2:])
+    )
+    assert abs(steady_batch_average - TARGET_BATCH_SIZE) <= 10
+    assert (
+        sum(preparation["gzip_operations"] for preparation in full_batches) /
+        len(full_batches)
+    ) < 2
+    assert len(batch_preparations) == len(requests_seen)
+    assert batch_preparations[-1]["bytes"] < MIN_BATCH_SIZE
+    assert batch_preparations[-1]["records"] == 1
+
+    received_messages = [
+        record["message"]
+        for request in requests_seen
+        for record in request["json"]
+    ]
+    assert received_messages == messages + [timeout_message]

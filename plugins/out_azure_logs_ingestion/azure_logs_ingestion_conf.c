@@ -24,6 +24,7 @@
 #include <fluent-bit/flb_oauth2.h>
 
 #include "azure_logs_ingestion.h"
+#include "azure_logs_ingestion_batch.h"
 #include "azure_logs_ingestion_conf.h"
 
 static int validate_auth_url_override(struct flb_output_instance *ins,
@@ -95,6 +96,21 @@ struct flb_az_li* flb_az_li_ctx_create(struct flb_output_instance *ins,
         return NULL;
     }
 
+    ret = pthread_mutex_init(&ctx->token_mutex, NULL);
+    if (ret != 0) {
+        flb_free(ctx);
+        return NULL;
+    }
+    ctx->token_mutex_initialized = FLB_TRUE;
+
+    ret = pthread_mutex_init(&ctx->batch_mutex, NULL);
+    if (ret != 0) {
+        pthread_mutex_destroy(&ctx->token_mutex);
+        flb_free(ctx);
+        return NULL;
+    }
+    ctx->batch_mutex_initialized = FLB_TRUE;
+
     /* Set the conext in output_instance so that we can retrieve it later */
     ctx->ins = ins;
     ctx->config = config;
@@ -105,6 +121,7 @@ struct flb_az_li* flb_az_li_ctx_create(struct flb_output_instance *ins,
     ret = flb_output_config_map_set(ins, (void *) ctx);
     if (ret == -1) {
         flb_plg_error(ins, "unable to load configuration");
+        flb_az_li_ctx_destroy(ctx);
         return NULL;
     }
 
@@ -143,6 +160,32 @@ struct flb_az_li* flb_az_li_ctx_create(struct flb_output_instance *ins,
         flb_plg_error(ins, "property 'table_name' is not defined");
         flb_az_li_ctx_destroy(ctx);
         return NULL;
+    }
+    if (ctx->buffering_enabled == FLB_TRUE) {
+        if (ctx->max_batch_size == 0) {
+            flb_plg_error(ins,
+                          "property 'max_batch_size' must be greater than zero");
+            flb_az_li_ctx_destroy(ctx);
+            return NULL;
+        }
+        if (ctx->min_batch_size == 0) {
+            flb_plg_error(ins,
+                          "property 'min_batch_size' must be greater than zero");
+            flb_az_li_ctx_destroy(ctx);
+            return NULL;
+        }
+        if (ctx->min_batch_size > ctx->max_batch_size) {
+            flb_plg_error(ins,
+                          "property 'min_batch_size' must not exceed "
+                          "'max_batch_size'");
+            flb_az_li_ctx_destroy(ctx);
+            return NULL;
+        }
+        if (ctx->batch_timeout <= 0) {
+            flb_plg_error(ins, "property 'batch_timeout' must be greater than zero");
+            flb_az_li_ctx_destroy(ctx);
+            return NULL;
+        }
     }
 
     if (ctx->auth_url_override) {
@@ -186,9 +229,6 @@ struct flb_az_li* flb_az_li_ctx_create(struct flb_output_instance *ins,
                     FLB_AZ_LI_DCE_URL_TMPLT, ctx->dce_url, 
                     ctx->dcr_id, ctx->table_name);
 
-    /* Initialize the auth mutex */
-    pthread_mutex_init(&ctx->token_mutex, NULL);
-
     /* Create oauth2 context */
     ctx->u_auth = flb_oauth2_create(config, ctx->auth_url,
                                     FLB_AZ_LI_TOKEN_TIMEOUT);
@@ -207,6 +247,50 @@ struct flb_az_li* flb_az_li_ctx_create(struct flb_output_instance *ins,
         return NULL;
     }
     flb_output_upstream_set(ctx->u_dce, ins);
+
+    if (ctx->buffering_enabled == FLB_TRUE) {
+        ret = flb_az_li_batch_init(ctx);
+        if (ret == -1) {
+            flb_plg_error(ins, "cannot initialize batch storage at '%s'",
+                          ctx->store_dir);
+            flb_az_li_ctx_destroy(ctx);
+            return NULL;
+        }
+    }
+
+#ifdef FLB_HAVE_METRICS
+    ctx->cmt_compression_ratio = cmt_gauge_create(
+        ins->cmt,
+        "fluentbit",
+        "azure_logs_ingestion",
+        "compression_ratio",
+        "Adaptive average ratio of uncompressed JSON bytes to gzip bytes.",
+        1, (char *[]) {"name"});
+    if (ctx->cmt_compression_ratio == NULL) {
+        flb_plg_error(ins, "cannot create compression ratio metric");
+        flb_az_li_ctx_destroy(ctx);
+        return NULL;
+    }
+
+    cmt_gauge_set(ctx->cmt_compression_ratio, cfl_time_now(), 0,
+                 1, (char *[]) {(char *) flb_output_name(ins)});
+
+    ctx->cmt_gzip_operations = cmt_counter_create(
+        ins->cmt,
+        "fluentbit",
+        "azure_logs_ingestion",
+        "gzip_operations_total",
+        "Total number of gzip operations performed.",
+        1, (char *[]) {"name"});
+    if (ctx->cmt_gzip_operations == NULL) {
+        flb_plg_error(ins, "cannot create gzip operations metric");
+        flb_az_li_ctx_destroy(ctx);
+        return NULL;
+    }
+
+    cmt_counter_set(ctx->cmt_gzip_operations, cfl_time_now(), 0,
+                   1, (char *[]) {(char *) flb_output_name(ins)});
+#endif
 
     flb_plg_info(ins, "dce_url='%s', dcr='%s', table='%s', stream='Custom-%s'",
                 ctx->dce_url, ctx->dcr_id, ctx->table_name, ctx->table_name);
@@ -236,6 +320,17 @@ int flb_az_li_ctx_destroy(struct flb_az_li *ctx)
     if (ctx->u_dce) {
         flb_upstream_destroy(ctx->u_dce);
     }
+
+    flb_az_li_batch_destroy_context(ctx);
+
+    if (ctx->batch_mutex_initialized == FLB_TRUE) {
+        pthread_mutex_destroy(&ctx->batch_mutex);
+    }
+
+    if (ctx->token_mutex_initialized == FLB_TRUE) {
+        pthread_mutex_destroy(&ctx->token_mutex);
+    }
+
     flb_free(ctx);
 
     return 0;

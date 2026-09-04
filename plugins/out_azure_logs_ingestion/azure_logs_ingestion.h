@@ -33,10 +33,18 @@
 #define FLB_AZ_LI_TLS_MODE          FLB_IO_TLS
 /* refresh token every 60 minutes */
 #define FLB_AZ_LI_TOKEN_TIMEOUT 3600
+#define FLB_AZ_LI_MAX_BATCH_SIZE "1048576"
+#define FLB_AZ_LI_MIN_BATCH_SIZE "204800"
+#define FLB_AZ_LI_BATCH_TIMEOUT  "30s"
+#define FLB_AZ_LI_STORE_DIR      "/tmp/fluent-bit/azure-logs-ingestion"
 
 #include <fluent-bit/flb_info.h>
+#include <fluent-bit/flb_fstore.h>
 #include <fluent-bit/flb_output.h>
+#include <fluent-bit/flb_scheduler.h>
 #include <fluent-bit/flb_sds.h>
+#include <cmetrics/cmt_counter.h>
+#include <cmetrics/cmt_gauge.h>
 
 /* Context structure for Azure Logs Ingestion API */
 struct flb_az_li {
@@ -56,12 +64,40 @@ struct flb_az_li {
     /* compress payload */
     int compress_enabled;
 
+    /* request batching */
+    int buffering_enabled;
+    size_t max_batch_size;
+    size_t min_batch_size;
+    int batch_timeout;
+    flb_sds_t store_dir;
+    size_t store_dir_limit_size;
+    size_t buffered_size;
+    uint64_t store_sequence;
+    uint64_t buffer_generation;
+    uint64_t last_probe_generation;
+    size_t last_probe_uncompressed_size;
+    double compression_ratio;
+    double average_compression_ratio;
+    int batch_processing;
+    int batch_retry_pending;
+    int timer_created;
+    struct flb_fstore *fs;
+    struct flb_fstore_stream *fs_stream;
+    flb_sds_t fs_stream_name;
+#ifdef FLB_HAVE_METRICS
+    struct cmt_gauge *cmt_compression_ratio;
+    struct cmt_counter *cmt_gzip_operations;
+#endif
+    pthread_mutex_t batch_mutex;
+    int batch_mutex_initialized;
+
     /* mangement auth */
     flb_sds_t auth_url_override;
     flb_sds_t auth_url;
     struct flb_oauth2 *u_auth;
     /* mutex for acquiring tokens */
     pthread_mutex_t token_mutex;
+    int token_mutex_initialized;
 
     /* upstream connection to the data collection endpoint */
     struct flb_upstream *u_dce;
